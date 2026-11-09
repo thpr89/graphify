@@ -1,10 +1,22 @@
-"""Godot extractors: GDScript (.gd, optional tree-sitter-gdscript dependency)."""
+"""Godot extractors.
+
+GDScript (.gd) uses the optional tree-sitter-gdscript grammar. Scenes (.tscn)
+and project.godot are INI-like text and are read with stdlib regex, so they
+work without the extra.
+"""
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
-from graphify.extractors.base import _file_stem, _make_id, _read_source_bytes, _read_text
+from graphify.extractors.base import (
+    _file_stem,
+    _make_id,
+    _read_source_bytes,
+    _read_source_text,
+    _read_text,
+)
 
 
 def _godot_root(path: Path) -> Path | None:
@@ -291,3 +303,132 @@ def extract_gdscript(path: Path) -> dict:
             stack.extend(node.children)
 
     return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
+
+
+_MAX_GODOT_TEXT_BYTES = 50 * 1024 * 1024
+
+_SECTION_RE = re.compile(r"^\[(\w+)(.*)\]\s*$")
+# key="quoted", key=ExtResource("id") / ExtResource( 1 ), or key=bare
+_ATTR_RE = re.compile(
+    r'(\w+)\s*=\s*(?:"([^"]*)"|ExtResource\(\s*"?([^")\s]+)"?\s*\)|([^\s\]]+))'
+)
+_SCRIPT_PROP_RE = re.compile(r'^script\s*=\s*ExtResource\(\s*"?([^")\s]+)"?\s*\)')
+_AUTOLOAD_RE = re.compile(r'^(\w+)\s*=\s*"\*?(res://[^"]+)"')
+_MAIN_SCENE_RE = re.compile(r'^run/main_scene\s*=\s*"(res://[^"]+)"')
+
+
+def _read_godot_text(path: Path) -> tuple[str | None, dict | None]:
+    """(text, None), or (None, error result) for an unreadable or huge file."""
+    try:
+        if path.stat().st_size > _MAX_GODOT_TEXT_BYTES:
+            return None, {"nodes": [], "edges": [], "error": "file too large (>50 MB)"}
+        return _read_source_text(path), None
+    except Exception as e:
+        return None, {"nodes": [], "edges": [], "error": str(e)}
+
+
+def _godot_edge(src: str, tgt: str, relation: str, str_path: str, line: int, **extra) -> dict:
+    return {
+        "source": src,
+        "target": tgt,
+        "relation": relation,
+        "confidence": "EXTRACTED",
+        "source_file": str_path,
+        "source_location": f"L{line}",
+        "weight": 1.0,
+        **extra,
+    }
+
+
+def extract_godot_scene(path: Path) -> dict:
+    """Extract a .tscn scene's wiring: the scripts it attaches, the scenes it
+    instances, and the methods its signal connections call."""
+    text, error = _read_godot_text(path)
+    if text is None:
+        return error or {"nodes": [], "edges": []}
+
+    str_path = str(path)
+    file_nid = _make_id(str_path)
+    nodes = [{"id": file_nid, "label": path.name, "file_type": "code",
+              "source_file": str_path, "source_location": "L1"}]
+    edges: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def link(target: str | None, relation: str, line: int, **extra) -> None:
+        if target and target != file_nid and (relation, target) not in seen:
+            seen.add((relation, target))
+            edges.append(_godot_edge(file_nid, target, relation, str_path, line, **extra))
+
+    ext: dict[str, tuple[str, str]] = {}      # ext_resource id -> (type, res path)
+    node_script: dict[str, str] = {}          # scene node path -> script res path
+    connections: list[tuple[str, str, int]] = []  # (target node path, method, line)
+    current_node: str | None = None
+
+    for line_no, line in enumerate(text.split("\n"), 1):
+        section = _SECTION_RE.match(line)
+        if section is None:
+            script = _SCRIPT_PROP_RE.match(line) if current_node is not None else None
+            if script and ext.get(script.group(1), ("", ""))[0] == "Script":
+                node_script[current_node] = ext[script.group(1)][1]
+            continue
+        kind = section.group(1)
+        attrs = {m.group(1): next((g for g in m.groups()[1:] if g is not None), "")
+                 for m in _ATTR_RE.finditer(section.group(2))}
+        current_node = None
+        if kind == "ext_resource" and "id" in attrs and "path" in attrs:
+            ext[attrs["id"]] = (attrs.get("type", ""), attrs["path"])
+            relation = {"Script": "uses", "PackedScene": "instantiates"}.get(attrs.get("type", ""))
+            if relation:
+                link(_res_target_id(path, attrs["path"]), relation, line_no)
+        elif kind == "node" and "name" in attrs:
+            parent = attrs.get("parent")
+            if parent is None:
+                current_node = "."
+            elif parent == ".":
+                current_node = attrs["name"]
+            else:
+                current_node = f"{parent}/{attrs['name']}"
+        elif kind == "connection" and "to" in attrs and "method" in attrs:
+            connections.append((attrs["to"], attrs["method"], line_no))
+
+    for to, method, line_no in connections:
+        script_path = _res_path(path, node_script.get(to, ""))
+        if script_path is not None:
+            link(_make_id(_file_stem(script_path), method), "calls", line_no,
+                 context="signal_connection")
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def extract_godot_project(path: Path) -> dict:
+    """Extract a project.godot's autoload singletons and main scene."""
+    text, error = _read_godot_text(path)
+    if text is None:
+        return error or {"nodes": [], "edges": []}
+
+    str_path = str(path)
+    file_nid = _make_id(str_path)
+    nodes = [{"id": file_nid, "label": path.name, "file_type": "code",
+              "source_file": str_path, "source_location": "L1"}]
+    edges: list[dict] = []
+    section = ""
+
+    for line_no, line in enumerate(text.split("\n"), 1):
+        header = _SECTION_RE.match(line)
+        if header:
+            section = header.group(1)
+        elif section == "autoload" and (m := _AUTOLOAD_RE.match(line)):
+            name, target = m.group(1), _res_target_id(path, m.group(2))
+            nid = _make_id(str_path, "autoload", name)
+            nodes.append({"id": nid, "label": name, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line_no}",
+                          "_godot_autoload": True})
+            edges.append(_godot_edge(file_nid, nid, "contains", str_path, line_no))
+            if target:
+                edges.append(_godot_edge(nid, target, "uses", str_path, line_no))
+        elif section == "application" and (m := _MAIN_SCENE_RE.match(line)):
+            target = _res_target_id(path, m.group(1))
+            if target:
+                edges.append(_godot_edge(file_nid, target, "uses", str_path, line_no))
+
+    return {"nodes": nodes, "edges": edges}

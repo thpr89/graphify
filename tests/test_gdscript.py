@@ -174,3 +174,77 @@ def test_named_receiver_calls_are_parked_not_guessed(tmp_path):
     (call,) = r["raw_calls"]
     assert (call["receiver"], call["callee"], call["language"]) == ("GameState", "save", "gdscript")
     assert call["is_member_call"] is True
+
+
+SCENE = """\
+[gd_scene load_steps=3 format=3 uid="uid://abc"]
+
+[ext_resource type="Script" uid="uid://s1" path="res://player.gd" id="1_a"]
+[ext_resource type="PackedScene" path="res://hud.tscn" id="2_b"]
+[ext_resource type="Script" path="res://button.gd" id="3_c"]
+
+[node name="Player" type="CharacterBody2D"]
+script = ExtResource("1_a")
+
+[node name="HUD" parent="." instance=ExtResource("2_b")]
+
+[node name="Panel" type="Control" parent="."]
+
+[node name="Button" type="Button" parent="Panel"]
+script = ExtResource("3_c")
+
+[connection signal="pressed" from="Panel/Button" to="." method="_on_pressed"]
+[connection signal="hover" from="." to="Panel/Button" method="_on_hover"]
+"""
+
+
+def test_scene_links_scripts_scenes_and_connections(tmp_path):
+    from graphify.extract import extract_godot_scene
+
+    root = _project(tmp_path)
+    player = _write(root, "player.gd", "func _on_pressed():\n\tpass\n")
+    button = _write(root, "button.gd", "func _on_hover():\n\tpass\n")
+    hud = _write(root, "hud.tscn", "[gd_scene format=3]\n")
+    r = extract_godot_scene(_write(root, "main.tscn", SCENE))
+    scene_id = r["nodes"][0]["id"]
+    ids = {n["label"]: n["id"] for f in (player, button) for n in extract_gdscript(f)["nodes"]}
+    got = {(e["relation"], e["target"]) for e in r["edges"] if e["source"] == scene_id}
+    assert got == {
+        ("uses", ids["player.gd"]), ("uses", ids["button.gd"]),
+        ("instantiates", extract_godot_scene(hud)["nodes"][0]["id"]),
+        ("calls", ids["_on_pressed()"]), ("calls", ids["_on_hover()"]),
+    }
+
+
+def test_godot3_scene_attribute_order_and_numeric_ids(tmp_path):
+    from graphify.extract import extract_godot_scene
+
+    root = _project(tmp_path)
+    src = ('[gd_scene load_steps=2 format=2]\n'
+           '[ext_resource path="res://p.gd" type="Script" id=1]\n'
+           '[node name="P" type="Node"]\nscript = ExtResource( 1 )\n'
+           '[connection signal="s" from="." to="." method="m"]\n')
+    r = extract_godot_scene(_write(root, "old.tscn", src))
+    assert len([e for e in r["edges"] if e["relation"] == "uses"]) == 1
+    assert len([e for e in r["edges"] if e["relation"] == "calls"]) == 1
+
+
+def test_project_file_lists_autoloads_and_main_scene(tmp_path):
+    from graphify.extract import extract_godot_project
+
+    src = ('[application]\nrun/main_scene="res://main.tscn"\n\n'
+           '[autoload]\nGameState="*res://game_state.gd"\nAudio="res://audio.tscn"\n\n'
+           '[input]\nGameStateX="*res://nope.gd"\n')
+    r = extract_godot_project(_write(tmp_path, "project.godot", src))
+    autoloads = {n["label"] for n in r["nodes"] if n.get("_godot_autoload")}
+    assert autoloads == {"GameState", "Audio"}
+    assert ("project.godot", "GameState") in _rel_pairs(r, "contains")
+    assert len([e for e in r["edges"] if e["relation"] == "uses"]) == 3
+
+
+def test_scene_and_project_suffixes_are_dispatched():
+    from graphify.extract import extract_godot_project, extract_godot_scene
+
+    assert _DISPATCH[".tscn"] is extract_godot_scene
+    assert _DISPATCH[".godot"] is extract_godot_project
+    assert {".tscn", ".godot"} <= CODE_EXTENSIONS
