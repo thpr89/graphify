@@ -71,6 +71,7 @@ LANGUAGE_ALIASES: dict[str, str] = {
     "verilog": ".v", "systemverilog": ".sv",
     "terraform": ".tf", "hcl": ".hcl",
     "ocaml": ".ml",
+    "gdscript": ".gd", "godot": ".gd",
     "lisp": ".lisp", "commonlisp": ".lisp",
     "markdown": ".md",
     "json": ".json",
