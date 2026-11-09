@@ -70,6 +70,12 @@ from graphify.extractors.dm import extract_dm, extract_dmf, extract_dmi, extract
 from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.erlang import extract_erlang, resolve_erlang_remote_calls  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
+from graphify.extractors.gdscript import (  # noqa: F401
+    extract_gdscript,
+    extract_godot_project,
+    extract_godot_scene,
+    resolve_gdscript_named_calls,
+)
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.yaml_config import extract_yaml  # noqa: F401
@@ -4301,6 +4307,7 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     ".cs": "dotnet", ".vb": "dotnet", ".razor": "dotnet", ".cshtml": "dotnet", ".xaml": "dotnet",
     ".lua": "lua", ".luau": "lua",
     ".zig": "zig",
+    ".gd": "gdscript", ".tscn": "gdscript", ".godot": "gdscript",
     ".ex": "elixir", ".exs": "elixir",
     ".jl": "julia",
     ".dart": "dart",
@@ -8760,6 +8767,11 @@ register_language_resolver(
 )
 register_language_resolver(
     LanguageResolver(
+        "gdscript_named_calls", frozenset({".gd", ".tscn"}), resolve_gdscript_named_calls
+    )
+)
+register_language_resolver(
+    LanguageResolver(
         "solidity_type_references", frozenset({".sol"}), resolve_solidity_type_references
     )
 )
@@ -9965,6 +9977,9 @@ _DISPATCH: dict[str, Any] = {
     ".astro": extract_astro,
     ".ejs": extract_ejs,
     ".dart": extract_dart,
+    ".gd": extract_gdscript,
+    ".tscn": extract_godot_scene,
+    ".godot": extract_godot_project,
     ".ml": extract_ocaml,
     ".mli": extract_ocaml,
     ".lisp": extract_commonlisp,
@@ -10042,6 +10057,7 @@ _EXTRA_FOR_EXTENSION = {
     ".asd": "commonlisp",
     ".robot": "robot",
     ".resource": "robot",
+    ".gd": "gdscript",
 }
 
 # Substrings an extractor's error carries to classify why a dependency-backed
