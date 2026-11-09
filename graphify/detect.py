@@ -2297,6 +2297,10 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                         safe_dirs.append(d)
                     dirnames[:] = safe_dirs
             for fname in filenames:
+                # Godot writes `x.gd.uid` and `icon.png.import` beside the file
+                # they describe: metadata, never source, and half of a project.
+                if fname.endswith((".uid", ".import")) and fname.rsplit(".", 1)[0] in filenames:
+                    continue
                 if fname in _SKIP_FILES:
                     if is_resolution_input(fname):
                         # Not corpus input, but a JS/TS resolution input: record

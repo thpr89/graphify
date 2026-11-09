@@ -6,6 +6,7 @@ work without the extra.
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 from pathlib import Path
@@ -31,32 +32,87 @@ def _godot_root(path: Path) -> Path | None:
     return None
 
 
-def _res_path(path: Path, res: str) -> Path | None:
-    """Map a `res://a/b.gd` reference made from `path` to a filesystem path,
-    or None when there is no project root or the reference leaves it."""
+_SCENE_UID_RE = re.compile(r'\buid="(uid://[^"]+)"')
+_SIDECAR_UID_RE = re.compile(r"(uid://\S+)")
+# The only files that become graph nodes. A link to anything else (a texture,
+# a .glb imported as a PackedScene) would mint a phantom leaf node.
+_LINKABLE_SUFFIXES = (".gd", ".tscn")
+
+
+@functools.lru_cache(maxsize=8)
+def _uid_index(root: str) -> dict[str, str]:
+    """`uid://…` -> path under `root`, for every script (`x.gd.uid` sidecar,
+    Godot 4.4+) and scene (`uid=` in its header).
+    ponytail: built once per process per project, so a file added while a
+    watcher runs resolves by uid only after a restart; key on mtimes if that
+    ever matters."""
+    index: dict[str, str] = {}
+    for directory, subdirs, files in os.walk(root):
+        subdirs[:] = [d for d in subdirs if not d.startswith(".")]
+        for name in files:
+            sidecar = name.endswith(".uid")
+            target = name[:-len(".uid")] if sidecar else name
+            if not target.endswith(_LINKABLE_SUFFIXES):
+                continue
+            try:
+                with open(os.path.join(directory, name), encoding="utf-8", errors="replace") as f:
+                    first = f.readline(4096)
+            except OSError:
+                continue
+            match = _SIDECAR_UID_RE.match(first) if sidecar else _SCENE_UID_RE.search(first)
+            if match:
+                index.setdefault(match.group(1), os.path.join(directory, target))
+    return index
+
+
+def _res_path(path: Path, ref: str) -> Path | None:
+    """Map a reference made from `path` to the script or scene file it names,
+    or None. `ref` is `res://a/b.gd`, `uid://…`, or a path relative to `path`.
+    None when the file is not a script or scene, does not exist (a link would
+    mint a node named after this machine's absolute path), or lies outside the
+    project."""
     root = _godot_root(path)
-    if root is None or not res.startswith("res://"):
+    base = os.path.normpath(root) if root is not None else None
+    if ref.startswith("uid://"):
+        target = _uid_index(base).get(ref) if base is not None else None
+    elif ref.startswith("res://"):
+        target = os.path.join(base, ref[len("res://"):]) if base is not None else None
+    elif ref and "://" not in ref and not os.path.isabs(ref):
+        target = os.path.join(path.parent, ref)
+    else:
+        target = None
+    if target is None:
         return None
-    base = os.path.normpath(root)
-    target = os.path.normpath(os.path.join(base, res[len("res://"):]))
-    # relpath, not a prefix test: for a relative input path run from the
-    # project root, base is "." and the target carries no "./" prefix.
-    inside = os.path.relpath(target, base)
-    if inside in (".", "..") or inside.startswith(".." + os.sep):
+    target = os.path.normpath(target)
+    if base is not None:
+        # relpath, not a prefix test: for a relative input path run from the
+        # project root, base is "." and the target carries no "./" prefix.
+        inside = os.path.relpath(target, base)
+        if inside in (".", "..") or inside.startswith(".." + os.sep):
+            return None
+    if not target.endswith(_LINKABLE_SUFFIXES) or not os.path.isfile(target):
         return None
     return Path(target)
 
 
-def _file_link(path: Path, res: str) -> dict | None:
-    """Target fields for a file-to-file edge to `res`, or None if unresolvable.
+def _file_link(path: Path, ref: str) -> dict | None:
+    """Target fields for a file-to-file edge to `ref`, or None if unresolvable.
     Always `imports_from` with `target_file`: that pair is what the corpus
     passes use to keep same-named siblings (player.gd / player.tscn, which
     share one file id) apart when they re-point the edge."""
-    target = _res_path(path, res)
+    target = _res_path(path, ref)
     if target is None:
         return None
     return {"target": _make_id(str(target)), "relation": "imports_from",
             "target_file": str(target)}
+
+
+# Top-level declarations, for the text after a syntax error the grammar gave up on.
+_FALLBACK_DECL_RE = re.compile(
+    rb"^(?:(?:static[ \t]+)?func|(signal)|(class))[ \t]+([A-Za-z_]\w*)", re.MULTILINE
+)
+
+Scope = tuple[str, ...]  # enclosing inner class names; () is the script itself
 
 
 def extract_gdscript(path: Path) -> dict:
@@ -80,7 +136,7 @@ def extract_gdscript(path: Path) -> dict:
     nodes: list[dict] = []
     edges: list[dict] = []
     raw_calls: list[dict] = []
-    seen_ids: set[str] = set()
+    node_by_id: dict[str, dict] = {}
     seen_edges: set[tuple[str, str, str]] = set()
 
     def text(node) -> str:
@@ -90,16 +146,16 @@ def extract_gdscript(path: Path) -> dict:
         return node.start_point[0] + 1
 
     def add_node(nid: str, label: str, line: int, **extra) -> None:
-        if nid not in seen_ids:
-            seen_ids.add(nid)
-            nodes.append({
+        if nid not in node_by_id:
+            node_by_id[nid] = {
                 "id": nid,
                 "label": label,
                 "file_type": "code",
                 "source_file": str_path,
                 "source_location": f"L{line}",
                 **extra,
-            })
+            }
+            nodes.append(node_by_id[nid])
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", **extra) -> None:
@@ -121,22 +177,26 @@ def extract_gdscript(path: Path) -> dict:
     file_nid = _make_id(str_path)
     add_node(file_nid, path.name, 1)
 
-    # scope (inner class name, or None for the script itself) -> name -> node id
-    funcs: dict[str | None, dict[str, str]] = {}
-    signals: dict[str | None, dict[str, str]] = {}
-    classes: dict[str, str] = {}
-    # (owner id, base class name, line): bound after pass 1 so a base class
-    # declared later in the file resolves to its local node, not a stub.
-    pending_extends: list[tuple[str, str, int]] = []
+    funcs: dict[Scope, dict[str, str]] = {}    # scope -> function name -> node id
+    signals: dict[Scope, dict[str, str]] = {}  # scope -> signal name -> node id
+    statics: set[str] = set()                  # script-level `static func` names
+    class_scope: dict[str, Scope] = {}         # class name -> its scope (first wins)
+    class_ids: dict[Scope, str] = {}           # scope -> class node id
+    bases: dict[Scope, Scope] = {}             # class -> base class from this file
+    # (owner id, scope, base class name, line): bound after pass 1 so a base
+    # class declared later in the file is known.
+    pending_extends: list[tuple[str, Scope, str, int]] = []
     # (caller id, scope, node to walk for calls)
-    bodies: list[tuple[str, str | None, Any]] = []
+    bodies: list[tuple[str, Scope, Any]] = []
+    # script-level `const Name = preload("…")` -> id of the file it loads
+    preloaded: dict[str, str] = {}
 
-    def scoped_id(scope: str | None, name: str) -> str:
+    def scoped_id(scope: Scope, name: str) -> str:
         """Id for a declaration. Ids fold case and underscores, so `_init` and
         `init`, or `enum State` and `func state()`, would share one: the first
         keeps the plain id and later ones are salted with their exact name."""
-        nid = _make_id(stem, scope, name) if scope else _make_id(stem, name)
-        return _make_id(nid, decl_salt(name)) if nid in seen_ids else nid
+        nid = _make_id(stem, *scope, name)
+        return _make_id(nid, decl_salt(name)) if nid in node_by_id else nid
 
     def name_of(node) -> str | None:
         name_node = node.child_by_field_name("name")
@@ -145,19 +205,45 @@ def extract_gdscript(path: Path) -> dict:
     def string_value(node) -> str:
         return text(node).lstrip("&^").strip("\"'")
 
-    def record_extends(ext, owner_nid: str) -> None:
+    def first_arg(call_node):
+        args = call_node.child_by_field_name("arguments")
+        return args.named_children[0] if args is not None and args.named_children else None
+
+    def record_extends(ext, owner_nid: str, scope: Scope) -> None:
         base = ext.named_children[0] if ext.named_children else None
         if base is None:
             return
-        if base.type == "type":
-            pending_extends.append((owner_nid, text(base), line_of(ext)))
-        elif base.type == "string":  # extends "res://base.gd"
+        if base.type == "string":  # extends "res://base.gd"
             link = _file_link(path, string_value(base))
             if link:
                 # resolve_gdscript_named_calls adds the `inherits` edge once
                 # the corpus passes have settled this edge's target.
                 add_edge(owner_nid, link["target"], link["relation"], line_of(ext),
                          target_file=link["target_file"], context="extends")
+        elif base.type == "type" and '"' not in text(base):
+            pending_extends.append((owner_nid, scope, text(base), line_of(ext)))
+
+    def declare_function(owner_nid: str, scope: Scope, name: str, line: int, static: bool) -> str:
+        nid = scoped_id(scope, name)
+        add_node(nid, f"{name}()", line, **({} if scope else {"_gdscript_func": True}))
+        add_edge(owner_nid, nid, "contains" if owner_nid == file_nid else "method", line)
+        funcs.setdefault(scope, {}).setdefault(name, nid)
+        if static and not scope:
+            statics.add(name)
+        return nid
+
+    def declare_member(owner_nid: str, scope: Scope, name: str, line: int) -> str:
+        nid = scoped_id(scope, name)
+        add_node(nid, name, line)
+        add_edge(owner_nid, nid, "contains", line)
+        return nid
+
+    def declare_class(owner_nid: str, scope: Scope, name: str, line: int) -> tuple[str, Scope]:
+        inner = (*scope, name)
+        nid = declare_member(owner_nid, scope, name, line)
+        class_scope.setdefault(name, inner)
+        class_ids[inner] = nid
+        return nid, inner
 
     # A script that declares `class_name Foo` IS the class Foo: its members
     # hang off the class node. Without one they hang off the file node.
@@ -167,52 +253,46 @@ def extract_gdscript(path: Path) -> dict:
             owner = _make_id(stem, cname)
             add_node(owner, cname, line_of(child), _gdscript_class_name=True)
             add_edge(file_nid, owner, "contains", line_of(child))
-            classes[cname] = owner
+            class_scope[cname] = ()
             break
+    class_ids[()] = owner
 
-    def walk_defs(container, owner_nid: str, scope: str | None) -> None:
-        member_rel = "contains" if owner_nid == file_nid else "method"
+    def walk_defs(container, owner_nid: str, scope: Scope) -> None:
         for child in container.children:
             t = child.type
             line = line_of(child)
             if t == "class_name_statement":
                 ext = child.child_by_field_name("extends")
                 if ext is not None:
-                    record_extends(ext, owner_nid)
+                    record_extends(ext, owner_nid, scope)
             elif t == "extends_statement":
-                record_extends(child, owner_nid)
+                record_extends(child, owner_nid, scope)
             elif t in ("function_definition", "constructor_definition"):
-                name = name_of(child) or "_init"
-                nid = scoped_id(scope, name)
-                add_node(nid, f"{name}()", line, **({} if scope else {"_gdscript_func": True}))
-                add_edge(owner_nid, nid, member_rel, line)
-                funcs.setdefault(scope, {}).setdefault(name, nid)
-                body = child.child_by_field_name("body")
-                if body is not None:
-                    bodies.append((nid, scope, body))
+                static = any(c.type == "static_keyword" for c in child.children)
+                nid = declare_function(owner_nid, scope, name_of(child) or "_init", line, static)
+                # Default arguments are evaluated by the function too.
+                for field in ("parameters", "body"):
+                    part = child.child_by_field_name(field)
+                    if part is not None:
+                        bodies.append((nid, scope, part))
             elif t in ("signal_statement", "enum_definition"):
                 name = name_of(child)
                 if not name:  # anonymous enum
                     continue
-                nid = scoped_id(scope, name)
-                add_node(nid, name, line)
-                add_edge(owner_nid, nid, "contains", line)
+                nid = declare_member(owner_nid, scope, name, line)
                 if t == "signal_statement":
                     signals.setdefault(scope, {}).setdefault(name, nid)
             elif t == "class_definition":
                 name = name_of(child)
                 if not name:
                     continue
-                nid = scoped_id(None, name)
-                add_node(nid, name, line)
-                add_edge(owner_nid, nid, "contains", line)
-                classes.setdefault(name, nid)
+                nid, inner = declare_class(owner_nid, scope, name, line)
                 ext = child.child_by_field_name("extends")
                 if ext is not None:
-                    record_extends(ext, nid)
+                    record_extends(ext, nid, inner)
                 body = child.child_by_field_name("body")
                 if body is not None:
-                    walk_defs(body, nid, name)
+                    walk_defs(body, nid, inner)
             elif t == "ERROR":
                 # Keep whatever parsed around a syntax error.
                 walk_defs(child, owner_nid, scope)
@@ -220,35 +300,69 @@ def extract_gdscript(path: Path) -> dict:
                 # var/const initialisers run at load time: credit their calls
                 # to the owning class (or file).
                 bodies.append((owner_nid, scope, child))
+                value = child.child_by_field_name("value")
+                if (not scope and value is not None and value.type == "call"
+                        and (name := name_of(child))
+                        and text(value.named_children[0]) in ("preload", "load")
+                        and (arg := first_arg(value)) is not None and arg.type == "string"
+                        and (link := _file_link(path, string_value(arg)))):
+                    preloaded[name] = link["target"]
 
-    walk_defs(root, owner, None)
+    walk_defs(root, owner, ())
+
+    if root.has_error:
+        # After some errors the grammar drops the rest of the file. Recover the
+        # top-level names from the text; their bodies and calls stay unknown.
+        for match in _FALLBACK_DECL_RE.finditer(source):
+            name = match.group(3).decode("utf-8", "replace")
+            line = source.count(b"\n", 0, match.start()) + 1
+            if match.group(1):
+                if name not in signals.get((), {}):
+                    signals.setdefault((), {})[name] = declare_member(owner, (), name, line)
+            elif match.group(2):
+                if name not in class_scope:
+                    declare_class(owner, (), name, line)
+            elif name not in funcs.get((), {}):
+                declare_function(owner, (), name, line, match.group(0).startswith(b"static"))
 
     # A base class from this file is linked now. Any other name is either
     # another script's `class_name` or an engine class, and only the corpus can
     # tell which: leave the name on the node for resolve_gdscript_named_calls.
     # No placeholder node is minted, because `Player` would share its id with a
     # root-level player.gd file node and `Node` would join every script.
-    for owner_nid, base, line in pending_extends:
-        if base in classes:
-            add_edge(owner_nid, classes[base], "inherits", line)
-        else:
-            next(n for n in nodes if n["id"] == owner_nid)["_gdscript_extends"] = base
+    for owner_nid, scope, base, line in pending_extends:
+        base_scope = class_scope.get(base)
+        if base_scope is not None and base_scope != scope:
+            add_edge(owner_nid, class_ids[base_scope], "inherits", line)
+            bases[scope] = base_scope
+        elif base_scope is None:
+            node_by_id[owner_nid]["_gdscript_extends"] = base
 
-    def lookup(table: dict[str | None, dict[str, str]], scope: str | None, name: str) -> str | None:
-        return table.get(scope, {}).get(name) or table.get(None, {}).get(name)
+    def member(table: dict[Scope, dict[str, str]], scope: Scope | None, name: str) -> str | None:
+        """`name` as a member of the class at `scope`: its own, or inherited
+        from a base class declared in this file. Never the enclosing script's:
+        an inner class is a class of its own."""
+        visited: set[Scope] = set()
+        while scope is not None and scope not in visited:
+            if name in table.get(scope, {}):
+                return table[scope][name]
+            visited.add(scope)
+            scope = bases.get(scope)
+        return None
 
-    def first_arg(call_node):
-        args = call_node.child_by_field_name("arguments")
-        return args.named_children[0] if args is not None and args.named_children else None
+    def callable_named(scope: Scope, name: str) -> str | None:
+        """What a bare `name()` calls: a member, or failing that one of the
+        script's static functions, which an inner class can reach unqualified."""
+        return member(funcs, scope, name) or (funcs[()].get(name) if name in statics else None)
 
-    def handle_call(node, caller: str, scope: str | None) -> None:
+    def handle_call(node, caller: str, scope: Scope) -> None:
         callee = node.named_children[0] if node.named_children else None
         if callee is None or callee.type != "identifier":
             return
         name = text(callee)
         arg = first_arg(node)
         if name == "emit_signal" and arg is not None and arg.type in ("string", "string_name"):
-            sig = lookup(signals, scope, string_value(arg))
+            sig = member(signals, scope, string_value(arg))
             if sig:
                 add_edge(caller, sig, "uses", line_of(node))
             return
@@ -258,13 +372,15 @@ def extract_gdscript(path: Path) -> dict:
                 add_edge(file_nid, link["target"], link["relation"], line_of(node),
                          target_file=link["target_file"])
             return
-        target = lookup(funcs, scope, name)
+        target = callable_named(scope, name)
         if target:
             add_edge(caller, target, "calls", line_of(node))
 
-    def handle_attribute(node, caller: str, scope: str | None) -> None:
+    def handle_attribute(node, caller: str, scope: Scope) -> None:
+        # `receiver.method(...)`, possibly with more chained after it
+        # (`a.b().c()`): only the first hop has a receiver we can name.
         parts = node.named_children
-        if len(parts) != 2 or parts[0].type != "identifier" or parts[1].type != "attribute_call":
+        if len(parts) < 2 or parts[0].type != "identifier" or parts[1].type != "attribute_call":
             return
         receiver = text(parts[0])
         method_node = parts[1].named_children[0] if parts[1].named_children else None
@@ -272,22 +388,24 @@ def extract_gdscript(path: Path) -> dict:
             return
         method = text(method_node)
         line = line_of(node)
-        if receiver == "self":
-            target = lookup(funcs, scope, method)
-            if target:
-                add_edge(caller, target, "calls", line)
+        if receiver == "super":
             return
-        sig = lookup(signals, scope, receiver)
+        sig = member(signals, scope, receiver)
         if sig:
             if method == "emit":
                 add_edge(caller, sig, "uses", line)
             elif method == "connect":
                 arg = first_arg(parts[1])
-                handler = lookup(funcs, scope, text(arg)) if arg is not None and arg.type == "identifier" else None
+                handler = member(funcs, scope, text(arg)) if arg is not None and arg.type == "identifier" else None
                 if handler:
                     add_edge(sig, handler, "calls", line, confidence="INFERRED")
             return
-        if receiver == "super":
+        if receiver == "self" or receiver in class_scope:
+            # `self.m()`, or `Inner.m()` / `ThisScript.m()` on a class from
+            # this file. A miss (`Inner.new()`) is an engine method, not ours.
+            target = member(funcs, scope if receiver == "self" else class_scope[receiver], method)
+            if target:
+                add_edge(caller, target, "calls", line)
             return
         # `Name.method()`: only another file can say what `Name` is (an
         # autoload, a `class_name`, or just a local variable). Park it for
@@ -312,6 +430,15 @@ def extract_gdscript(path: Path) -> dict:
                 handle_attribute(node, caller, scope)
             stack.extend(node.children)
 
+    # `Name.method()` on such a constant is parked like any named receiver.
+    # The names ride on the import edge, whose target the corpus passes
+    # settle, for resolve_gdscript_named_calls to bind the call to that file.
+    for edge in edges:
+        if edge["source"] == file_nid and edge["relation"] == "imports_from":
+            names = [name for name, target in preloaded.items() if target == edge["target"]]
+            if names:
+                edge["_gdscript_consts"] = names
+
     return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
 
 
@@ -323,8 +450,9 @@ _ATTR_RE = re.compile(
     r'(\w+)\s*=\s*(?:"([^"]*)"|ExtResource\(\s*"?([^")\s]+)"?\s*\)|([^\s\]]+))'
 )
 _SCRIPT_PROP_RE = re.compile(r'^script\s*=\s*ExtResource\(\s*"?([^")\s]+)"?\s*\)')
-_AUTOLOAD_RE = re.compile(r'^(\w+)\s*=\s*"\*?(res://[^"]+)"')
-_MAIN_SCENE_RE = re.compile(r'^run/main_scene\s*=\s*"(res://[^"]+)"')
+_AUTOLOAD_RE = re.compile(r'^(\w+)\s*=\s*"\*?((?:res|uid)://[^"]+)"')
+_MAIN_SCENE_RE = re.compile(r'^run/main_scene\s*=\s*"((?:res|uid)://[^"]+)"')
+_UNESCAPED_QUOTE_RE = re.compile(r'(?<!\\)"')
 
 
 def _read_godot_text(path: Path) -> tuple[str | None, dict | None]:
@@ -365,17 +493,27 @@ def extract_godot_scene(path: Path) -> dict:
     edge_to: dict[str, dict] = {}  # res path -> the edge to that file
 
     ext: dict[str, tuple[str, str]] = {}      # ext_resource id -> (type, res path)
-    node_script: dict[str, str] = {}          # scene node path -> script res path
+    # scene node path -> res path of what answers its signals: its script, or
+    # for an instanced child without one, the scene it instances.
+    node_target: dict[str, str] = {}
     connections: list[tuple[str, str, int]] = []  # (target node path, method, line)
     current_node: str | None = None
+    in_string = False  # inside a property value that spans lines
 
     for line_no, line in enumerate(text.split("\n"), 1):
+        # A multi-line string value (BBCode in a RichTextLabel, say) can hold
+        # a line like `[center]Hello[/center]` that is not a section header.
+        odd_quotes = len(_UNESCAPED_QUOTE_RE.findall(line)) % 2 == 1
+        if in_string:
+            in_string = not odd_quotes
+            continue
         section = _SECTION_RE.match(line)
         if section is None:
+            in_string = odd_quotes
             script = _SCRIPT_PROP_RE.match(line)
             if (current_node is not None and script
                     and ext.get(script.group(1), ("", ""))[0] == "Script"):
-                node_script[current_node] = ext[script.group(1)][1]
+                node_target[current_node] = ext[script.group(1)][1]
             continue
         kind = section.group(1)
         attrs = {m.group(1): next((g for g in m.groups()[1:] if g is not None), "")
@@ -393,21 +531,32 @@ def extract_godot_scene(path: Path) -> dict:
         elif kind == "node" and "name" in attrs:
             parent = attrs.get("parent")
             if parent is None:
-                current_node = "."
+                node_path = "."
             elif parent == ".":
-                current_node = attrs["name"]
+                node_path = attrs["name"]
             else:
-                current_node = f"{parent}/{attrs['name']}"
+                node_path = f"{parent}/{attrs['name']}"
+            current_node = node_path
+            instanced = ext.get(attrs.get("instance", ""), ("", ""))
+            if instanced[0] == "PackedScene":
+                node_target[node_path] = instanced[1]
         elif kind == "connection" and "to" in attrs and "method" in attrs:
             connections.append((attrs["to"], attrs["method"], line_no))
 
-    # A connection calls a method of the script attached to its target node.
-    # The method's node id belongs to another file, and an id minted here from
-    # that file's path is not re-pointed when only this scene is re-extracted.
-    # So the method name rides on the edge to the script, whose target the
-    # corpus passes do settle, and resolve_gdscript_named_calls binds it.
+    # The script on the scene's root node is what answers for the scene when
+    # another scene instances it.
+    root_edge = edge_to.get(node_target.get(".", ""))
+    if root_edge is not None and root_edge["context"] == "script":
+        root_edge["context"] = "root_script"
+
+    # A connection calls a method of the script attached to its target node
+    # (for an instanced child: of that scene's root script). The method's node
+    # id belongs to another file, and an id minted here from that file's path
+    # is not re-pointed when only this scene is re-extracted. So the method
+    # name rides on the edge to that file, whose target the corpus passes do
+    # settle, and resolve_gdscript_named_calls binds it.
     for to, method, _line_no in connections:
-        edge = edge_to.get(node_script.get(to, ""))
+        edge = edge_to.get(node_target.get(to, ""))
         if edge is not None and method not in edge.setdefault("_godot_connections", []):
             edge["_godot_connections"].append(method)
 
@@ -455,8 +604,10 @@ def resolve_gdscript_named_calls(
 ) -> None:
     """Bind what a single script cannot: `extends Name` to the script declaring
     `class_name Name`, parked `Name.method()` calls when `Name` is such a
-    class or an autoload singleton (project.godot), and a scene's signal
-    connections to the methods of its attached scripts."""
+    class, an autoload singleton (project.godot) or a constant holding a
+    preloaded script, and a scene's signal connections to the methods of its
+    attached scripts."""
+    source_by_id = {node["id"]: str(node.get("source_file") or "") for node in all_nodes}
     file_source_by_id = {
         node["id"]: str(node["source_file"])
         for node in all_nodes
@@ -476,6 +627,7 @@ def resolve_gdscript_named_calls(
             scripts_by_name.setdefault(name, set()).add(target)
     functions: dict[tuple[str, str], list[str]] = {}
     class_ids: dict[str, list[str]] = {}
+    class_of_script: dict[str, str] = {}  # script source file -> its class_name node
     for node in all_nodes:
         if not node.get("source_file"):
             continue
@@ -483,6 +635,7 @@ def resolve_gdscript_named_calls(
         if node.get("_gdscript_class_name"):
             scripts_by_name.setdefault(str(node["label"]), set()).add(source)
             class_ids.setdefault(str(node["label"]), []).append(node["id"])
+            class_of_script[source] = node["id"]
         elif node.get("_gdscript_func"):
             functions.setdefault((source, str(node["label"]).removesuffix("()")), []).append(node["id"])
 
@@ -490,16 +643,21 @@ def resolve_gdscript_named_calls(
     # context, and every edge appended here is kept: only emit for files that
     # were extracted in this run, or unchanged files would gain duplicates.
     batch = {node.get("source_file") for result in per_file for node in result.get("nodes", [])}
+    # The base name is popped: it is scratch for this pass, and the per-file
+    # cache, written before it, keeps its own copy.
     inherits = [
         (node["id"], bases[0], node.get("source_file", ""), node.get("source_location", ""))
         for node in all_nodes
-        if node.get("source_file") in batch
-        and len(bases := class_ids.get(str(node.get("_gdscript_extends", "")), [])) == 1
+        if len(bases := class_ids.get(str(node.pop("_gdscript_extends", "")), [])) == 1
+        and node.get("source_file") in batch
     ]
     # `extends "res://base.gd"` was emitted as an import so the corpus passes
-    # could settle its target; it is settled now.
+    # could settle its target; it is settled now. Like `extends Name`, it lands
+    # on the base script's class when that script declares a `class_name`.
     inherits += [
-        (edge["source"], edge["target"], edge.get("source_file", ""), edge.get("source_location", ""))
+        (edge["source"],
+         class_of_script.get(file_source_by_id.get(edge["target"], ""), edge["target"]),
+         edge.get("source_file", ""), edge.get("source_location", ""))
         for edge in all_edges
         if edge.get("context") == "extends" and edge.get("relation") == "imports_from"
         and edge.get("source_file") in batch
@@ -518,18 +676,17 @@ def resolve_gdscript_named_calls(
             })
 
     existing = {
-        (edge.get("source"), edge.get("target"))
-        for edge in all_edges
-        if edge.get("relation") == "calls"
+        (edge.get("source"), edge.get("target"), edge.get("relation")) for edge in all_edges
     }
-    def add_call(caller, target, source_file, location, confidence: str, context: str) -> None:
-        if caller == target or (caller, target) in existing:
+    def add_call(caller, target, source_file, location, confidence: str, context: str,
+                 relation: str = "calls") -> None:
+        if caller == target or (caller, target, relation) in existing:
             return
-        existing.add((caller, target))
+        existing.add((caller, target, relation))
         all_edges.append({
             "source": caller,
             "target": target,
-            "relation": "calls",
+            "relation": relation,
             "context": context,
             "confidence": confidence,
             "source_file": source_file,
@@ -537,26 +694,56 @@ def resolve_gdscript_named_calls(
             "weight": 1.0,
         })
 
-    # Scene signal connections, parked on the scene -> script edge. Popped so
-    # the list never reaches graph.json; the per-file cache was written before
-    # this pass and keeps it.
+    # Scene signal connections, parked on the scene's edge to the script, or to
+    # the instanced scene whose root script answers. Popped so the list never
+    # reaches graph.json; the per-file cache was written before this pass and
+    # keeps it.
+    root_script_of = {
+        edge.get("source"): edge.get("target") for edge in all_edges
+        if edge.get("context") == "root_script" and edge.get("relation") == "imports_from"
+    }
     for edge in list(all_edges):
         methods = edge.pop("_godot_connections", None)
-        script = file_source_by_id.get(edge.get("target"))
+        target = edge.get("target")
+        script = file_source_by_id.get(root_script_of.get(target, target))
         for method in methods or []:
             candidates = functions.get((script, method), []) if script else []
             if len(candidates) == 1:
                 add_call(edge["source"], candidates[0], edge.get("source_file", ""),
                          edge.get("source_location", ""), "EXTRACTED", "signal_connection")
 
+    # (script, constant name) -> the script that constant preloads. Popped for
+    # the same reason as the connections above.
+    preloaded: dict[tuple[str, str], str] = {}
+    for edge in all_edges:
+        target = file_source_by_id.get(edge.get("target"), "")
+        for name in edge.pop("_gdscript_consts", None) or []:
+            if target.endswith(".gd"):
+                preloaded[source_by_id.get(edge.get("source"), ""), name] = target
+    file_id_of = {source: nid for nid, source in file_source_by_id.items()}
+
     for result in per_file:
         for call in result.get("raw_calls", []):
             if call.get("language") != "gdscript":
                 continue
-            scripts = scripts_by_name.get(str(call.get("receiver", "")), set())
-            if len(scripts) != 1:
-                continue
-            candidates = functions.get((next(iter(scripts)), str(call.get("callee", ""))), [])
+            caller, receiver = call.get("caller_nid"), str(call.get("receiver", ""))
+            # A constant names its file outright; a class or autoload name is
+            # only trusted when exactly one script answers to it.
+            script = preloaded.get((source_by_id.get(caller, ""), receiver))
+            confidence, context = "EXTRACTED", "preloaded_script_call"
+            if script is None:
+                scripts = scripts_by_name.get(receiver, set())
+                if len(scripts) != 1:
+                    continue
+                script = next(iter(scripts))
+                confidence, context = "INFERRED", "named_receiver_call"
+            where = call.get("source_file", ""), call.get("source_location", "")
+            candidates = functions.get((script, str(call.get("callee", ""))), [])
             if len(candidates) == 1:
-                add_call(call.get("caller_nid"), candidates[0], call.get("source_file", ""),
-                         call.get("source_location", ""), "INFERRED", "named_receiver_call")
+                add_call(caller, candidates[0], *where, confidence, context)
+            elif call.get("callee") == "new" and not candidates:
+                # `Name.new()` makes an instance: no function to point at, so
+                # point at the class, or at the script when it has no class_name.
+                made = class_of_script.get(script) or file_id_of.get(script)
+                if made:
+                    add_call(caller, made, *where, confidence, "instantiates", "references")
