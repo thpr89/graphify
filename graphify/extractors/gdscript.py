@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 from graphify.extractors.base import (
     _file_stem,
@@ -124,7 +125,7 @@ def extract_gdscript(path: Path) -> dict:
     # declared later in the file resolves to its local node, not a stub.
     pending_extends: list[tuple[str, str, int]] = []
     # (caller id, scope, node to walk for calls)
-    bodies: list[tuple[str, str | None, object]] = []
+    bodies: list[tuple[str, str | None, Any]] = []
 
     def scoped_id(scope: str | None, name: str) -> str:
         return _make_id(stem, scope, name) if scope else _make_id(stem, name)
@@ -350,8 +351,8 @@ def extract_godot_scene(path: Path) -> dict:
 
     str_path = str(path)
     file_nid = _make_id(str_path)
-    nodes = [{"id": file_nid, "label": path.name, "file_type": "code",
-              "source_file": str_path, "source_location": "L1"}]
+    nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
+                          "source_file": str_path, "source_location": "L1"}]
     edges: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
@@ -368,8 +369,9 @@ def extract_godot_scene(path: Path) -> dict:
     for line_no, line in enumerate(text.split("\n"), 1):
         section = _SECTION_RE.match(line)
         if section is None:
-            script = _SCRIPT_PROP_RE.match(line) if current_node is not None else None
-            if script and ext.get(script.group(1), ("", ""))[0] == "Script":
+            script = _SCRIPT_PROP_RE.match(line)
+            if (current_node is not None and script
+                    and ext.get(script.group(1), ("", ""))[0] == "Script"):
                 node_script[current_node] = ext[script.group(1)][1]
             continue
         kind = section.group(1)
@@ -411,8 +413,8 @@ def extract_godot_project(path: Path) -> dict:
 
     str_path = str(path)
     file_nid = _make_id(str_path)
-    nodes = [{"id": file_nid, "label": path.name, "file_type": "code",
-              "source_file": str_path, "source_location": "L1"}]
+    nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
+                          "source_file": str_path, "source_location": "L1"}]
     edges: list[dict] = []
     section = ""
 
@@ -474,10 +476,15 @@ def resolve_gdscript_named_calls(
         elif node.get("_gdscript_func"):
             functions.setdefault((source, str(node["label"]).removesuffix("()")), []).append(node["id"])
 
+    # On an incremental update the lists also hold the unchanged corpus as
+    # context, and every edge appended here is kept: only emit for files that
+    # were extracted in this run, or unchanged files would gain duplicates.
+    batch = {node.get("source_file") for result in per_file for node in result.get("nodes", [])}
     inherits = [
         (node["id"], bases[0], node.get("source_file", ""), node.get("source_location", ""))
         for node in all_nodes
-        if len(bases := class_ids.get(str(node.get("_gdscript_extends", "")), [])) == 1
+        if node.get("source_file") in batch
+        and len(bases := class_ids.get(str(node.get("_gdscript_extends", "")), [])) == 1
     ]
     # `extends "res://base.gd"` was emitted as an import so the corpus passes
     # could settle its target; it is settled now.
@@ -485,6 +492,7 @@ def resolve_gdscript_named_calls(
         (edge["source"], edge["target"], edge.get("source_file", ""), edge.get("source_location", ""))
         for edge in all_edges
         if edge.get("context") == "extends" and edge.get("relation") == "imports_from"
+        and edge.get("source_file") in batch
         and str(edge.get("source_file", "")).endswith(".gd")
     ]
     for source, target, source_file, location in inherits:

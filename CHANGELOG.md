@@ -2,6 +2,10 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## Unreleased
+
+- Feature: **gdscript** Godot 4 projects are extracted. A `.gd` script yields its `class_name` class, inner classes, functions, signals and enums, with `extends`, `preload`/`load`, same-file calls and signal `emit`/`connect` as edges; a call on an autoload singleton or another script's `class_name` (`GameState.save()`, `Player.make()`) binds to the function it names, and binds nothing when the name is unknown or declared twice. A `.tscn` scene links to the scripts it attaches, the scenes it instances, and the methods its signal connections call; `project.godot` contributes its autoloads and main scene. The `.godot/` import cache is skipped. GDScript parsing needs the new optional `graphifyy[gdscript]` extra (`tree-sitter-gdscript`); scenes and `project.godot` need none.
+
 ## 0.9.104 (2026-11-07)
 
 - Security: **skill** the `/graphify` runbook no longer substitutes the scan path into Python code. Every generated code block (detect, AST and semantic extraction, build, diagnose, label, manifest, and `--update`) now reads the resolved scan root from the trusted `graphify-out/.graphify_root` sidecar that Step 1 writes through a quoted heredoc, instead of pasting the agent-supplied path into a string literal. A directory whose name carried a quote or `$(...)` could previously break out of `Path('INPUT_PATH')` and run as code; it is now read as inert data. Covers the assembled hosts and the Aider/Devin monoliths (#4762, thanks @danikdanik).

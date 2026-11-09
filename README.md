@@ -289,6 +289,7 @@ Pi has no `PreToolUse` hook, so `graphify pi guard install` registers a native P
 | `pascal` | Pascal / Delphi `.pas`/`.dpr`/`.dpk`/`.inc` AST extraction (more accurate `calls`/`inherits` edges; falls back to a regex extractor when absent) | `uv tool install "graphifyy[pascal]"` |
 | `ocaml` | OCaml `.ml`/`.mli` AST extraction | `uv tool install "graphifyy[ocaml]"` |
 | `commonlisp` | Common Lisp `.lisp`/`.cl`/`.lsp`/`.asd` AST extraction | `uv tool install "graphifyy[commonlisp]"` |
+| `gdscript` | Godot GDScript `.gd` AST extraction (classes, functions, signals, `extends`/`preload`, autoload and `class_name` calls). Scenes (`.tscn`) and `project.godot` need no extra. Third-party code under `addons/` is scanned unless listed in `.graphifyignore`. Prebuilt wheels: macOS arm64, Linux x86_64, Windows x64; other platforms need a C compiler | `uv tool install "graphifyy[gdscript]"` |
 | `robot` | Robot Framework `.robot`/`.resource` extraction (suites, test cases, keywords, keyword-call and resource/library import edges) | `uv tool install "graphifyy[robot]"` |
 | `chinese` | Chinese query segmentation (jieba) | `uv tool install "graphifyy[chinese]"` |
 | `all` | Everything above | `uv tool install "graphifyy[all]"` |

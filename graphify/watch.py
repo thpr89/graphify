@@ -2731,6 +2731,7 @@ def _rebuild_code(
                         "_ts_fields", "_ts_static_fields",
                         "_py_fixture", "_py_return_type", "_go_fields",
                         "_go_package_path",
+                        "_gdscript_class_name", "_gdscript_func", "_godot_autoload",
                     ):
                         if node.get(marker):
                             ctx_node[marker] = node[marker]

@@ -345,3 +345,39 @@ def test_root_level_script_scene_pair_keeps_its_edges(tmp_path):
 def test_extends_by_path_inherits_from_that_script(tmp_path):
     r = _corpus(tmp_path, {"boss.gd": 'extends "res://enemy.gd"\nfunc roar():\n\tpass\n'})
     assert ("boss.gd", "enemy.gd") in _rel_pairs(r, "inherits")
+
+
+def _graph_triples(root: Path) -> list[tuple[str, str, str]]:
+    import json
+
+    graph = json.loads((root / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    label = {n["id"]: n["label"] for n in graph["nodes"]}
+    return [(label.get(link.get("_src", link["source"]), "?"), link["relation"],
+             label.get(link.get("_tgt", link["target"]), "?")) for link in graph["links"]]
+
+
+def test_incremental_rebuild_keeps_cross_file_edges(tmp_path):
+    # An update that re-extracts only enemy.gd still has to know that Player is
+    # a class_name and GameState an autoload, both declared in unchanged files.
+    from graphify.watch import _rebuild_code
+
+    root = _project(tmp_path / "game")
+    (root / "project.godot").write_text(
+        '[autoload]\nGameState="*res://game_state.gd"\n', encoding="utf-8")
+    _write(root, "game_state.gd", "extends Node\nfunc save():\n\tpass\n")
+    _write(root, "player.gd",
+           "class_name Player\nextends CharacterBody2D\nstatic func make():\n\tpass\n")
+    _write(root, "boss.gd", "extends Player\n")
+    enemy = _write(root, "enemy.gd", "extends Player\nfunc spawn():\n\tPlayer.make()\n")
+    assert _rebuild_code(root, acquire_lock=False) is True
+    before = _graph_triples(root)
+    assert ("spawn()", "calls", "make()") in before
+
+    enemy.write_text("extends Player\nfunc spawn():\n\tPlayer.make()\n"
+                     "func flee():\n\tGameState.save()\n", encoding="utf-8")
+    assert _rebuild_code(root, changed_paths=[enemy], acquire_lock=False) is True
+    after = _graph_triples(root)
+    assert ("spawn()", "calls", "make()") in after
+    assert ("flee()", "calls", "save()") in after
+    assert after.count(("enemy.gd", "inherits", "Player")) == 1
+    assert after.count(("boss.gd", "inherits", "Player")) == 1
