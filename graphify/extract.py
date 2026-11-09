@@ -4307,7 +4307,7 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     ".cs": "dotnet", ".vb": "dotnet", ".razor": "dotnet", ".cshtml": "dotnet", ".xaml": "dotnet",
     ".lua": "lua", ".luau": "lua",
     ".zig": "zig",
-    ".gd": "gdscript",
+    ".gd": "gdscript", ".tscn": "gdscript", ".godot": "gdscript",
     ".ex": "elixir", ".exs": "elixir",
     ".jl": "julia",
     ".dart": "dart",
@@ -8766,7 +8766,9 @@ register_language_resolver(
     LanguageResolver("r_sourced_calls", frozenset({".r", ".R"}), resolve_r_sourced_calls)
 )
 register_language_resolver(
-    LanguageResolver("gdscript_named_calls", frozenset({".gd"}), resolve_gdscript_named_calls)
+    LanguageResolver(
+        "gdscript_named_calls", frozenset({".gd", ".tscn"}), resolve_gdscript_named_calls
+    )
 )
 register_language_resolver(
     LanguageResolver(

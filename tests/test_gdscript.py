@@ -221,11 +221,14 @@ def test_scene_links_scripts_scenes_and_connections(tmp_path):
     r = extract_godot_scene(_write(root, "main.tscn", SCENE))
     scene_id = r["nodes"][0]["id"]
     ids = {n["label"]: n["id"] for f in (player, button) for n in extract_gdscript(f)["nodes"]}
-    got = {(e["relation"], e["target"]) for e in r["edges"] if e["source"] == scene_id}
-    assert got == {
-        ("imports_from", ids["player.gd"]), ("imports_from", ids["button.gd"]),
-        ("imports_from", extract_godot_scene(hud)["nodes"][0]["id"]),
-        ("calls", ids["_on_pressed()"]), ("calls", ids["_on_hover()"]),
+    assert {e["source"] for e in r["edges"]} == {scene_id}
+    assert {e["relation"] for e in r["edges"]} == {"imports_from"}
+    # A connection names a method of an attached script. It rides on the edge
+    # to that script until resolve_gdscript_named_calls turns it into `calls`.
+    assert {e["target"]: e.get("_godot_connections") for e in r["edges"]} == {
+        ids["player.gd"]: ["_on_pressed"],
+        ids["button.gd"]: ["_on_hover"],
+        extract_godot_scene(hud)["nodes"][0]["id"]: None,
     }
     assert {e["target_file"] for e in r["edges"] if e["relation"] == "imports_from"} == {
         str(player), str(button), str(hud)}
@@ -240,8 +243,8 @@ def test_godot3_scene_attribute_order_and_numeric_ids(tmp_path):
            '[node name="P" type="Node"]\nscript = ExtResource( 1 )\n'
            '[connection signal="s" from="." to="." method="m"]\n')
     r = extract_godot_scene(_write(root, "old.tscn", src))
-    assert len([e for e in r["edges"] if e["relation"] == "imports_from"]) == 1
-    assert len([e for e in r["edges"] if e["relation"] == "calls"]) == 1
+    (edge,) = r["edges"]
+    assert (edge["relation"], edge["_godot_connections"]) == ("imports_from", ["m"])
 
 
 def test_project_file_lists_autoloads_and_main_scene(tmp_path):
@@ -327,6 +330,7 @@ def test_root_level_script_scene_pair_keeps_its_edges(tmp_path):
     })
     by_id = {n["id"]: n for n in r["nodes"]}
     assert len(by_id) == len(r["nodes"])
+    assert not [e for e in r["edges"] if "_godot_connections" in e]
 
     def targets(source_label: str, relation: str) -> list[tuple[str, str]]:
         return sorted(
@@ -381,3 +385,78 @@ def test_incremental_rebuild_keeps_cross_file_edges(tmp_path):
     assert ("flee()", "calls", "save()") in after
     assert after.count(("enemy.gd", "inherits", "Player")) == 1
     assert after.count(("boss.gd", "inherits", "Player")) == 1
+
+
+def test_preload_and_load_import_the_file(tmp_path):
+    root = _project(tmp_path)
+    base = _write(root, "base.gd", "func f():\n\tpass\n")
+    other = _write(root, "other.gd", "func f():\n\tpass\n")
+    r = extract_gdscript(_write(root, "user.gd",
+                                'const B = preload("res://base.gd")\n'
+                                'func g():\n\tvar s = load("res://other.gd")\n'))
+    links = {e["target_file"]: e.get("context") for e in r["edges"] if e["relation"] == "imports_from"}
+    assert links == {str(base): None, str(other): None}
+
+
+def test_res_paths_resolve_for_relative_input_paths(tmp_path, monkeypatch):
+    root = _project(tmp_path)
+    _write(root, "base.gd", "func f():\n\tpass\n")
+    _write(root, "a.gd", 'const B = preload("res://base.gd")\n')
+    monkeypatch.chdir(root)
+    r = extract_gdscript(Path("a.gd"))
+    assert [e["target"] for e in r["edges"] if e["relation"] == "imports_from"] == [
+        extract_gdscript(Path("base.gd"))["nodes"][0]["id"]]
+
+
+def test_names_that_normalise_alike_stay_separate(tmp_path):
+    # Node ids fold case and underscores, so `_init`/`init` and an enum `State`
+    # next to `func state()` would otherwise merge into one node.
+    src = ("enum State { A }\nfunc _init():\n\tpass\nfunc init():\n\tsetup()\n"
+           "func setup():\n\tpass\nfunc state():\n\tinit()\n")
+    r = extract_gdscript(_write(tmp_path, "a.gd", src))
+    assert {"State", "_init()", "init()", "setup()", "state()"} <= _labels(r)
+    assert len({n["id"] for n in r["nodes"]}) == len(r["nodes"])
+    assert _rel_pairs(r, "calls") == {("init()", "setup()"), ("state()", "init()")}
+
+
+def test_other_languages_do_not_bind_to_autoloads(tmp_path):
+    # An autoload entry is a bare type-like name in project.godot. A Python
+    # `GameState()` or `class Foo(GameState)` must not land on it.
+    r = _corpus(tmp_path, {
+        "tools/build.py": "def run():\n    GameState()\n\nclass Foo(GameState):\n    pass\n"})
+    by_id = {n["id"]: n for n in r["nodes"]}
+    into_autoload = [
+        (by_id[e["source"]]["label"], e["relation"]) for e in r["edges"]
+        if e["target"] in by_id and by_id[e["target"]].get("_godot_autoload")
+        and str(e.get("source_file", "")).endswith(".py")]
+    assert into_autoload == []
+
+
+def test_scene_only_incremental_rebuild_keeps_connection_calls(tmp_path):
+    from graphify.watch import _rebuild_code
+
+    root = _project(tmp_path / "game")
+    _write(root, "scripts/player.gd", "func _on_pressed():\n\tpass\n")
+    body = ('[gd_scene format=3]\n'
+            '[ext_resource type="Script" path="res://scripts/player.gd" id="1"]\n'
+            '[node name="P" type="Node"]\nscript = ExtResource("1")\n'
+            '[connection signal="pressed" from="." to="." method="_on_pressed"]\n')
+    scene = _write(root, "scenes/main.tscn", body)
+    assert _rebuild_code(root, acquire_lock=False) is True
+    assert ("main.tscn", "calls", "_on_pressed()") in _graph_triples(root)
+
+    scene.write_text(body + '[node name="Extra" type="Node" parent="."]\n', encoding="utf-8")
+    assert _rebuild_code(root, changed_paths=[scene], acquire_lock=False) is True
+    assert ("main.tscn", "calls", "_on_pressed()") in _graph_triples(root)
+
+
+def test_cached_rerun_keeps_scene_connection_calls(tmp_path):
+    # The resolver consumes the connection list from the in-memory edge; the
+    # per-file cache must still hold it for the next run.
+    scene = ('[gd_scene format=3]\n'
+             '[ext_resource type="Script" path="res://player.gd" id="1"]\n'
+             '[node name="P" type="Node"]\nscript = ExtResource("1")\n'
+             '[connection signal="pressed" from="." to="." method="_ready"]\n')
+    for _ in range(2):
+        r = _corpus(tmp_path, {"main.tscn": scene})
+        assert ("main.tscn", "_ready()") in _rel_pairs(r, "calls")

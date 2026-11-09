@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from graphify.ids import decl_salt
 from graphify.extractors.base import (
     _file_stem,
     _make_id,
@@ -38,7 +39,10 @@ def _res_path(path: Path, res: str) -> Path | None:
         return None
     base = os.path.normpath(root)
     target = os.path.normpath(os.path.join(base, res[len("res://"):]))
-    if target == base or not target.startswith(base + os.sep):
+    # relpath, not a prefix test: for a relative input path run from the
+    # project root, base is "." and the target carries no "./" prefix.
+    inside = os.path.relpath(target, base)
+    if inside in (".", "..") or inside.startswith(".." + os.sep):
         return None
     return Path(target)
 
@@ -128,7 +132,11 @@ def extract_gdscript(path: Path) -> dict:
     bodies: list[tuple[str, str | None, Any]] = []
 
     def scoped_id(scope: str | None, name: str) -> str:
-        return _make_id(stem, scope, name) if scope else _make_id(stem, name)
+        """Id for a declaration. Ids fold case and underscores, so `_init` and
+        `init`, or `enum State` and `func state()`, would share one: the first
+        keeps the plain id and later ones are salted with their exact name."""
+        nid = _make_id(stem, scope, name) if scope else _make_id(stem, name)
+        return _make_id(nid, decl_salt(name)) if nid in seen_ids else nid
 
     def name_of(node) -> str | None:
         name_node = node.child_by_field_name("name")
@@ -195,7 +203,7 @@ def extract_gdscript(path: Path) -> dict:
                 name = name_of(child)
                 if not name:
                     continue
-                nid = _make_id(stem, name)
+                nid = scoped_id(None, name)
                 add_node(nid, name, line)
                 add_edge(owner_nid, nid, "contains", line)
                 classes.setdefault(name, nid)
@@ -354,12 +362,7 @@ def extract_godot_scene(path: Path) -> dict:
     nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
                           "source_file": str_path, "source_location": "L1"}]
     edges: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-
-    def link(target: str, relation: str, line: int, **extra) -> None:
-        if target != file_nid and (relation, target) not in seen:
-            seen.add((relation, target))
-            edges.append(_godot_edge(file_nid, target, relation, str_path, line, **extra))
+    edge_to: dict[str, dict] = {}  # res path -> the edge to that file
 
     ext: dict[str, tuple[str, str]] = {}      # ext_resource id -> (type, res path)
     node_script: dict[str, str] = {}          # scene node path -> script res path
@@ -382,9 +385,11 @@ def extract_godot_scene(path: Path) -> dict:
             ext[attrs["id"]] = (attrs.get("type", ""), attrs["path"])
             context = {"Script": "script", "PackedScene": "instance"}.get(attrs.get("type", ""))
             target = _file_link(path, attrs["path"]) if context else None
-            if target:
-                link(target["target"], target["relation"], line_no,
-                     target_file=target["target_file"], context=context)
+            if target and target["target"] != file_nid and attrs["path"] not in edge_to:
+                edge_to[attrs["path"]] = _godot_edge(
+                    file_nid, target["target"], target["relation"], str_path, line_no,
+                    target_file=target["target_file"], context=context)
+                edges.append(edge_to[attrs["path"]])
         elif kind == "node" and "name" in attrs:
             parent = attrs.get("parent")
             if parent is None:
@@ -396,11 +401,15 @@ def extract_godot_scene(path: Path) -> dict:
         elif kind == "connection" and "to" in attrs and "method" in attrs:
             connections.append((attrs["to"], attrs["method"], line_no))
 
-    for to, method, line_no in connections:
-        script_path = _res_path(path, node_script.get(to, ""))
-        if script_path is not None:
-            link(_make_id(_file_stem(script_path), method), "calls", line_no,
-                 context="signal_connection")
+    # A connection calls a method of the script attached to its target node.
+    # The method's node id belongs to another file, and an id minted here from
+    # that file's path is not re-pointed when only this scene is re-extracted.
+    # So the method name rides on the edge to the script, whose target the
+    # corpus passes do settle, and resolve_gdscript_named_calls binds it.
+    for to, method, _line_no in connections:
+        edge = edge_to.get(node_script.get(to, ""))
+        if edge is not None and method not in edge.setdefault("_godot_connections", []):
+            edge["_godot_connections"].append(method)
 
     return {"nodes": nodes, "edges": edges}
 
@@ -445,8 +454,9 @@ def resolve_gdscript_named_calls(
     per_file: list[dict], all_nodes: list[dict], all_edges: list[dict]
 ) -> None:
     """Bind what a single script cannot: `extends Name` to the script declaring
-    `class_name Name`, and parked `Name.method()` calls when `Name` is such a
-    class or an autoload singleton (project.godot)."""
+    `class_name Name`, parked `Name.method()` calls when `Name` is such a
+    class or an autoload singleton (project.godot), and a scene's signal
+    connections to the methods of its attached scripts."""
     file_source_by_id = {
         node["id"]: str(node["source_file"])
         for node in all_nodes
@@ -512,6 +522,33 @@ def resolve_gdscript_named_calls(
         for edge in all_edges
         if edge.get("relation") == "calls"
     }
+    def add_call(caller, target, source_file, location, confidence: str, context: str) -> None:
+        if caller == target or (caller, target) in existing:
+            return
+        existing.add((caller, target))
+        all_edges.append({
+            "source": caller,
+            "target": target,
+            "relation": "calls",
+            "context": context,
+            "confidence": confidence,
+            "source_file": source_file,
+            "source_location": location,
+            "weight": 1.0,
+        })
+
+    # Scene signal connections, parked on the scene -> script edge. Popped so
+    # the list never reaches graph.json; the per-file cache was written before
+    # this pass and keeps it.
+    for edge in list(all_edges):
+        methods = edge.pop("_godot_connections", None)
+        script = file_source_by_id.get(edge.get("target"))
+        for method in methods or []:
+            candidates = functions.get((script, method), []) if script else []
+            if len(candidates) == 1:
+                add_call(edge["source"], candidates[0], edge.get("source_file", ""),
+                         edge.get("source_location", ""), "EXTRACTED", "signal_connection")
+
     for result in per_file:
         for call in result.get("raw_calls", []):
             if call.get("language") != "gdscript":
@@ -520,20 +557,6 @@ def resolve_gdscript_named_calls(
             if len(scripts) != 1:
                 continue
             candidates = functions.get((next(iter(scripts)), str(call.get("callee", ""))), [])
-            caller = call.get("caller_nid")
-            if len(candidates) != 1 or candidates[0] == caller:
-                continue
-            pair = (caller, candidates[0])
-            if pair in existing:
-                continue
-            existing.add(pair)
-            all_edges.append({
-                "source": caller,
-                "target": candidates[0],
-                "relation": "calls",
-                "context": "named_receiver_call",
-                "confidence": "INFERRED",
-                "source_file": call.get("source_file", ""),
-                "source_location": call.get("source_location", ""),
-                "weight": 1.0,
-            })
+            if len(candidates) == 1:
+                add_call(call.get("caller_nid"), candidates[0], call.get("source_file", ""),
+                         call.get("source_location", ""), "INFERRED", "named_receiver_call")
