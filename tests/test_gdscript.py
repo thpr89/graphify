@@ -18,6 +18,7 @@ _NO_GRAMMAR_NEEDED = {
     "test_scene_and_project_suffixes_are_dispatched",
     "test_scene_multiline_string_does_not_end_the_node",
     "test_only_scripts_and_scenes_that_exist_are_linked",
+    "test_godot_sidecar_files_are_not_reported_as_unclassified",
 }
 
 
@@ -652,3 +653,76 @@ def test_autoload_named_in_two_projects_binds_nothing(tmp_path):
                   _write(root, "user.gd", "func f():\n\tGlobals.reset()\n")]
     r = extract(paths, cache_root=tmp_path / "cache", root=tmp_path, parallel=False)
     assert not _rel_pairs(r, "calls")
+
+
+VIEW = ('const Board := preload("res://board.gd")\n'
+        "func draw():\n\tBoard.clear()\n\tBoard.new()\n\tBoard.missing()\n")
+
+
+def test_calls_through_a_preloaded_constant_resolve(tmp_path):
+    # `const X := preload("res://x.gd")` then `X.fn()` is how a project without
+    # class_name declarations reaches its other scripts.
+    r = _corpus(tmp_path, {"board.gd": "static func clear():\n\tpass\n", "view.gd": VIEW})
+    assert ("draw()", "clear()") in _rel_pairs(r, "calls")
+    assert ("draw()", "board.gd") in _rel_pairs(r, "references")
+    assert not [e for e in r["edges"] if "_gdscript_consts" in e]
+
+
+def test_a_constant_name_belongs_to_the_script_that_declares_it(tmp_path):
+    r = _corpus(tmp_path, {
+        "board.gd": "static func clear():\n\tpass\n",
+        "other/board.gd": "static func wipe():\n\tpass\n",
+        "view.gd": VIEW,
+        "other/view.gd": ('const Board = preload("board.gd")\n'
+                          "func redraw():\n\tBoard.wipe()\n\tBoard.clear()\n"),
+    })
+    calls = _rel_pairs(r, "calls")
+    assert ("draw()", "clear()") in calls and ("redraw()", "wipe()") in calls
+    assert ("redraw()", "clear()") not in calls
+
+
+def test_new_on_a_named_class_references_it(tmp_path):
+    r = _corpus(tmp_path, {"spawner.gd": "func spawn():\n\tPlayer.new()\n"})
+    assert ("spawn()", "Player") in _rel_pairs(r, "references")
+
+
+def test_incremental_rebuild_keeps_preloaded_constant_calls(tmp_path):
+    from graphify.watch import _rebuild_code
+
+    root = _project(tmp_path / "game")
+    _write(root, "board.gd", "static func clear():\n\tpass\n")
+    view = _write(root, "view.gd", VIEW)
+    assert _rebuild_code(root, acquire_lock=False) is True
+    assert ("draw()", "calls", "clear()") in _graph_triples(root)
+
+    view.write_text(VIEW + "func again():\n\tBoard.clear()\n", encoding="utf-8")
+    assert _rebuild_code(root, changed_paths=[view], acquire_lock=False) is True
+    after = _graph_triples(root)
+    assert ("draw()", "calls", "clear()") in after
+    assert ("again()", "calls", "clear()") in after
+
+
+def test_swift_files_in_the_project_do_not_bind_gdscript_calls(tmp_path):
+    # The Swift member-call pass reads every language's parked calls. With an
+    # iOS plugin in the project it bound `STEPS.size()` to anything named steps.
+    pytest.importorskip("tree_sitter_swift")
+    r = _corpus(tmp_path, {
+        "ios/haptics.swift": ("class Haptics {\n    func buzz() {}\n}\nclass Steps {}\n"
+                              "func go() {\n    let h = Haptics()\n    h.buzz()\n}\n"),
+        "tutorial.gd": "const STEPS := [1]\nfunc run():\n\tSTEPS.size()\n\tHaptics.buzz()\n",
+    })
+    calls = _rel_pairs(r, "calls")
+    assert ("go()", ".buzz()") in calls  # the pass still serves Swift
+    assert ("run()", ".buzz()") not in calls
+    assert ("run()", "Steps") not in _rel_pairs(r, "references")
+
+
+def test_godot_sidecar_files_are_not_reported_as_unclassified(tmp_path):
+    # Godot writes `x.gd.uid` and `icon.png.import` beside the file they
+    # describe; a project is half sidecars, which read as "no extractor".
+    from graphify.detect import detect
+
+    root = _project(tmp_path / "game")
+    for name in ("player.gd", "player.gd.uid", "icon.png", "icon.png.import", "stray.uid"):
+        _write(root, name, "x")
+    assert [Path(p).name for p in detect(root)["unclassified"]] == ["stray.uid"]

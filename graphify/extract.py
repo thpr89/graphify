@@ -5269,6 +5269,12 @@ def _resolve_swift_member_calls(
     for rc in all_raw_calls:
         if not rc.get("is_member_call"):
             continue
+        # `all_raw_calls` holds every language's member calls, and Swift's carry
+        # no `lang` tag. Without this an upper-cased receiver in any other
+        # language was typed as a Swift type: a GDScript `STEPS.size()` bound
+        # to whatever in the corpus was named `steps`.
+        if not str(rc.get("source_file", "")).lower().endswith(".swift"):
+            continue
         receiver = rc.get("receiver")
         callee = rc.get("callee")
         caller = rc.get("caller_nid")

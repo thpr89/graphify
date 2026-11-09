@@ -188,6 +188,8 @@ def extract_gdscript(path: Path) -> dict:
     pending_extends: list[tuple[str, Scope, str, int]] = []
     # (caller id, scope, node to walk for calls)
     bodies: list[tuple[str, Scope, Any]] = []
+    # script-level `const Name = preload("…")` -> id of the file it loads
+    preloaded: dict[str, str] = {}
 
     def scoped_id(scope: Scope, name: str) -> str:
         """Id for a declaration. Ids fold case and underscores, so `_init` and
@@ -202,6 +204,10 @@ def extract_gdscript(path: Path) -> dict:
 
     def string_value(node) -> str:
         return text(node).lstrip("&^").strip("\"'")
+
+    def first_arg(call_node):
+        args = call_node.child_by_field_name("arguments")
+        return args.named_children[0] if args is not None and args.named_children else None
 
     def record_extends(ext, owner_nid: str, scope: Scope) -> None:
         base = ext.named_children[0] if ext.named_children else None
@@ -294,6 +300,13 @@ def extract_gdscript(path: Path) -> dict:
                 # var/const initialisers run at load time: credit their calls
                 # to the owning class (or file).
                 bodies.append((owner_nid, scope, child))
+                value = child.child_by_field_name("value")
+                if (not scope and value is not None and value.type == "call"
+                        and (name := name_of(child))
+                        and text(value.named_children[0]) in ("preload", "load")
+                        and (arg := first_arg(value)) is not None and arg.type == "string"
+                        and (link := _file_link(path, string_value(arg)))):
+                    preloaded[name] = link["target"]
 
     walk_defs(root, owner, ())
 
@@ -341,10 +354,6 @@ def extract_gdscript(path: Path) -> dict:
         """What a bare `name()` calls: a member, or failing that one of the
         script's static functions, which an inner class can reach unqualified."""
         return member(funcs, scope, name) or (funcs[()].get(name) if name in statics else None)
-
-    def first_arg(call_node):
-        args = call_node.child_by_field_name("arguments")
-        return args.named_children[0] if args is not None and args.named_children else None
 
     def handle_call(node, caller: str, scope: Scope) -> None:
         callee = node.named_children[0] if node.named_children else None
@@ -420,6 +429,15 @@ def extract_gdscript(path: Path) -> dict:
             elif node.type == "attribute":
                 handle_attribute(node, caller, scope)
             stack.extend(node.children)
+
+    # `Name.method()` on such a constant is parked like any named receiver.
+    # The names ride on the import edge, whose target the corpus passes
+    # settle, for resolve_gdscript_named_calls to bind the call to that file.
+    for edge in edges:
+        if edge["source"] == file_nid and edge["relation"] == "imports_from":
+            names = [name for name, target in preloaded.items() if target == edge["target"]]
+            if names:
+                edge["_gdscript_consts"] = names
 
     return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
 
@@ -586,8 +604,10 @@ def resolve_gdscript_named_calls(
 ) -> None:
     """Bind what a single script cannot: `extends Name` to the script declaring
     `class_name Name`, parked `Name.method()` calls when `Name` is such a
-    class or an autoload singleton (project.godot), and a scene's signal
-    connections to the methods of its attached scripts."""
+    class, an autoload singleton (project.godot) or a constant holding a
+    preloaded script, and a scene's signal connections to the methods of its
+    attached scripts."""
+    source_by_id = {node["id"]: str(node.get("source_file") or "") for node in all_nodes}
     file_source_by_id = {
         node["id"]: str(node["source_file"])
         for node in all_nodes
@@ -656,18 +676,17 @@ def resolve_gdscript_named_calls(
             })
 
     existing = {
-        (edge.get("source"), edge.get("target"))
-        for edge in all_edges
-        if edge.get("relation") == "calls"
+        (edge.get("source"), edge.get("target"), edge.get("relation")) for edge in all_edges
     }
-    def add_call(caller, target, source_file, location, confidence: str, context: str) -> None:
-        if caller == target or (caller, target) in existing:
+    def add_call(caller, target, source_file, location, confidence: str, context: str,
+                 relation: str = "calls") -> None:
+        if caller == target or (caller, target, relation) in existing:
             return
-        existing.add((caller, target))
+        existing.add((caller, target, relation))
         all_edges.append({
             "source": caller,
             "target": target,
-            "relation": "calls",
+            "relation": relation,
             "context": context,
             "confidence": confidence,
             "source_file": source_file,
@@ -693,14 +712,38 @@ def resolve_gdscript_named_calls(
                 add_call(edge["source"], candidates[0], edge.get("source_file", ""),
                          edge.get("source_location", ""), "EXTRACTED", "signal_connection")
 
+    # (script, constant name) -> the script that constant preloads. Popped for
+    # the same reason as the connections above.
+    preloaded: dict[tuple[str, str], str] = {}
+    for edge in all_edges:
+        target = file_source_by_id.get(edge.get("target"), "")
+        for name in edge.pop("_gdscript_consts", None) or []:
+            if target.endswith(".gd"):
+                preloaded[source_by_id.get(edge.get("source"), ""), name] = target
+    file_id_of = {source: nid for nid, source in file_source_by_id.items()}
+
     for result in per_file:
         for call in result.get("raw_calls", []):
             if call.get("language") != "gdscript":
                 continue
-            scripts = scripts_by_name.get(str(call.get("receiver", "")), set())
-            if len(scripts) != 1:
-                continue
-            candidates = functions.get((next(iter(scripts)), str(call.get("callee", ""))), [])
+            caller, receiver = call.get("caller_nid"), str(call.get("receiver", ""))
+            # A constant names its file outright; a class or autoload name is
+            # only trusted when exactly one script answers to it.
+            script = preloaded.get((source_by_id.get(caller, ""), receiver))
+            confidence, context = "EXTRACTED", "preloaded_script_call"
+            if script is None:
+                scripts = scripts_by_name.get(receiver, set())
+                if len(scripts) != 1:
+                    continue
+                script = next(iter(scripts))
+                confidence, context = "INFERRED", "named_receiver_call"
+            where = call.get("source_file", ""), call.get("source_location", "")
+            candidates = functions.get((script, str(call.get("callee", ""))), [])
             if len(candidates) == 1:
-                add_call(call.get("caller_nid"), candidates[0], call.get("source_file", ""),
-                         call.get("source_location", ""), "INFERRED", "named_receiver_call")
+                add_call(caller, candidates[0], *where, confidence, context)
+            elif call.get("callee") == "new" and not candidates:
+                # `Name.new()` makes an instance: no function to point at, so
+                # point at the class, or at the script when it has no class_name.
+                made = class_of_script.get(script) or file_id_of.get(script)
+                if made:
+                    add_call(caller, made, *where, confidence, "instantiates", "references")
