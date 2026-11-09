@@ -136,3 +136,41 @@ def test_godot3_syntax_does_not_raise(tmp_path):
     src = "extends Node\nonready var x = 1\nexport var y = 2\nfunc f():\n\tyield(self, \"done\")\n"
     r = extract_gdscript(_write(tmp_path, "old.gd", src))
     assert "f()" in _labels(r)
+
+
+def _project(tmp_path: Path) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "project.godot").write_text("[application]\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_preload_and_path_extends_link_to_the_file(tmp_path):
+    root = _project(tmp_path)
+    base = _write(root, "base.gd", "func f():\n\tpass\n")
+    child = _write(root / "sub", "child.gd",
+                   'extends "res://base.gd"\nconst B = preload("res://base.gd")\n'
+                   'func g():\n\tvar s = load("res://base.gd")\n')
+    r = extract_gdscript(child)
+    base_id = extract_gdscript(base)["nodes"][0]["id"]
+    assert {(e["relation"], e["target"]) for e in r["edges"]} >= {
+        ("inherits", base_id), ("imports_from", base_id)}
+
+
+def test_res_path_without_a_project_root_adds_nothing(tmp_path):
+    r = extract_gdscript(_write(tmp_path, "loose.gd", 'const B = preload("res://base.gd")\n'))
+    assert "error" not in r
+    assert not [e for e in r["edges"] if e["relation"] == "imports_from"]
+
+
+def test_res_path_escaping_the_root_adds_nothing(tmp_path):
+    root = _project(tmp_path / "game")
+    r = extract_gdscript(_write(root, "a.gd", 'const B = preload("res://../outside.gd")\n'))
+    assert not [e for e in r["edges"] if e["relation"] == "imports_from"]
+
+
+def test_named_receiver_calls_are_parked_not_guessed(tmp_path):
+    r = extract_gdscript(_write(tmp_path, "a.gd", "func f():\n\tGameState.save()\n\tsuper.f()\n"))
+    assert not _rel_pairs(r, "calls")
+    (call,) = r["raw_calls"]
+    assert (call["receiver"], call["callee"], call["language"]) == ("GameState", "save", "gdscript")
+    assert call["is_member_call"] is True

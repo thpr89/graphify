@@ -1,9 +1,38 @@
 """Godot extractors: GDScript (.gd, optional tree-sitter-gdscript dependency)."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from graphify.extractors.base import _file_stem, _make_id, _read_source_bytes, _read_text
+
+
+def _godot_root(path: Path) -> Path | None:
+    """Nearest ancestor directory holding `project.godot`, which is what
+    `res://` is relative to. Never resolves symlinks: node ids are built from
+    paths as given, so a resolved root would disagree with a file's own id."""
+    for directory in path.parents:
+        if (directory / "project.godot").is_file():
+            return directory
+    return None
+
+
+def _res_path(path: Path, res: str) -> Path | None:
+    """Map a `res://a/b.gd` reference made from `path` to a filesystem path,
+    or None when there is no project root or the reference leaves it."""
+    root = _godot_root(path)
+    if root is None or not res.startswith("res://"):
+        return None
+    base = os.path.normpath(root)
+    target = os.path.normpath(os.path.join(base, res[len("res://"):]))
+    if target == base or not target.startswith(base + os.sep):
+        return None
+    return Path(target)
+
+
+def _res_target_id(path: Path, res: str) -> str | None:
+    target = _res_path(path, res)
+    return _make_id(str(target)) if target is not None else None
 
 
 def extract_gdscript(path: Path) -> dict:
@@ -26,6 +55,7 @@ def extract_gdscript(path: Path) -> dict:
     stem = _file_stem(path)
     nodes: list[dict] = []
     edges: list[dict] = []
+    raw_calls: list[dict] = []
     seen_ids: set[str] = set()
     seen_edges: set[tuple[str, str, str]] = set()
 
@@ -102,10 +132,19 @@ def extract_gdscript(path: Path) -> dict:
         name_node = node.child_by_field_name("name")
         return text(name_node) if name_node is not None else None
 
+    def string_value(node) -> str:
+        return text(node).lstrip("&^").strip("\"'")
+
     def record_extends(ext, owner_nid: str) -> None:
         base = ext.named_children[0] if ext.named_children else None
-        if base is not None and base.type == "type":
+        if base is None:
+            return
+        if base.type == "type":
             pending_extends.append((owner_nid, text(base), line_of(ext)))
+        elif base.type == "string":  # extends "res://base.gd"
+            target = _res_target_id(path, string_value(base))
+            if target:
+                add_edge(owner_nid, target, "inherits", line_of(ext))
 
     # A script that declares `class_name Foo` IS the class Foo: its members
     # hang off the class node. Without one they hang off the file node.
@@ -181,9 +220,6 @@ def extract_gdscript(path: Path) -> dict:
         args = call_node.child_by_field_name("arguments")
         return args.named_children[0] if args is not None and args.named_children else None
 
-    def string_value(node) -> str:
-        return text(node).lstrip("&^").strip("\"'")
-
     def handle_call(node, caller: str, scope: str | None) -> None:
         callee = node.named_children[0] if node.named_children else None
         if callee is None or callee.type != "identifier":
@@ -194,6 +230,11 @@ def extract_gdscript(path: Path) -> dict:
             sig = lookup(signals, scope, string_value(arg))
             if sig:
                 add_edge(caller, sig, "uses", line_of(node))
+            return
+        if name in ("preload", "load") and arg is not None and arg.type == "string":
+            target = _res_target_id(path, string_value(arg))
+            if target:
+                add_edge(file_nid, target, "imports_from", line_of(node))
             return
         target = lookup(funcs, scope, name)
         if target:
@@ -223,6 +264,21 @@ def extract_gdscript(path: Path) -> dict:
                 handler = lookup(funcs, scope, text(arg)) if arg is not None and arg.type == "identifier" else None
                 if handler:
                     add_edge(sig, handler, "calls", line, confidence="INFERRED")
+            return
+        if receiver == "super":
+            return
+        # `Name.method()`: only another file can say what `Name` is (an
+        # autoload, a `class_name`, or just a local variable). Park it for
+        # resolve_gdscript_named_calls instead of guessing by method name.
+        raw_calls.append({
+            "caller_nid": caller,
+            "callee": method,
+            "receiver": receiver,
+            "is_member_call": True,
+            "language": "gdscript",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+        })
 
     for caller, scope, body in bodies:
         stack = [body]
@@ -234,4 +290,4 @@ def extract_gdscript(path: Path) -> dict:
                 handle_attribute(node, caller, scope)
             stack.extend(node.children)
 
-    return {"nodes": nodes, "edges": edges, "raw_calls": []}
+    return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
