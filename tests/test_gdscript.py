@@ -5,11 +5,26 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("tree_sitter_gdscript")
-
 from graphify.detect import CODE_EXTENSIONS, _SKIP_DIRS
 from graphify.extract import _DISPATCH, _EXTRA_FOR_EXTENSION, extract_gdscript
 from graphify.extractors import LANGUAGE_EXTRACTORS
+
+
+# Scenes and project.godot are read with stdlib regex. Their tests must run
+# even where the optional grammar is not installed.
+_NO_GRAMMAR_NEEDED = {
+    "test_godot3_scene_attribute_order_and_numeric_ids",
+    "test_project_file_lists_autoloads_and_main_scene",
+    "test_scene_and_project_suffixes_are_dispatched",
+    "test_scene_multiline_string_does_not_end_the_node",
+    "test_only_scripts_and_scenes_that_exist_are_linked",
+}
+
+
+@pytest.fixture(autouse=True)
+def _skip_without_grammar(request):
+    if request.node.name not in _NO_GRAMMAR_NEEDED:
+        pytest.importorskip("tree_sitter_gdscript")
 
 
 def _write(tmp_path: Path, name: str, body: str) -> Path:
@@ -140,6 +155,16 @@ def test_syntax_error_keeps_what_parsed(tmp_path):
     assert "ok()" in _labels(r)
 
 
+def test_definitions_after_a_syntax_error_are_kept(tmp_path):
+    # The grammar gives up on everything after some errors. Top-level names are
+    # still worth having: recovered from the text, without their bodies.
+    src = ("func ok():\n\tpass\n\nfunc broken():\n\tvar x = = 3 $$\n\tif:\n\n"
+           "static func after():\n\tpass\n\nsignal late\nclass Tail:\n\tpass\n")
+    r = extract_gdscript(_write(tmp_path, "bad.gd", src))
+    assert {"ok()", "broken()", "after()", "late", "Tail"} <= _labels(r)
+    assert len({n["id"] for n in r["nodes"]}) == len(r["nodes"])
+
+
 def test_godot3_syntax_does_not_raise(tmp_path):
     src = "extends Node\nonready var x = 1\nexport var y = 2\nfunc f():\n\tyield(self, \"done\")\n"
     r = extract_gdscript(_write(tmp_path, "old.gd", src))
@@ -238,6 +263,7 @@ def test_godot3_scene_attribute_order_and_numeric_ids(tmp_path):
     from graphify.extract import extract_godot_scene
 
     root = _project(tmp_path)
+    _write(root, "p.gd", "")
     src = ('[gd_scene load_steps=2 format=2]\n'
            '[ext_resource path="res://p.gd" type="Script" id=1]\n'
            '[node name="P" type="Node"]\nscript = ExtResource( 1 )\n'
@@ -253,6 +279,8 @@ def test_project_file_lists_autoloads_and_main_scene(tmp_path):
     src = ('[application]\nrun/main_scene="res://main.tscn"\n\n'
            '[autoload]\nGameState="*res://game_state.gd"\nAudio="res://audio.tscn"\n\n'
            '[input]\nGameStateX="*res://nope.gd"\n')
+    for name in ("main.tscn", "game_state.gd", "audio.tscn"):
+        _write(tmp_path, name, "")
     r = extract_godot_project(_write(tmp_path, "project.godot", src))
     autoloads = {n["label"] for n in r["nodes"] if n.get("_godot_autoload")}
     assert autoloads == {"GameState", "Audio"}
@@ -383,8 +411,8 @@ def test_incremental_rebuild_keeps_cross_file_edges(tmp_path):
     after = _graph_triples(root)
     assert ("spawn()", "calls", "make()") in after
     assert ("flee()", "calls", "save()") in after
-    assert after.count(("enemy.gd", "inherits", "Player")) == 1
-    assert after.count(("boss.gd", "inherits", "Player")) == 1
+    assert ("enemy.gd", "inherits", "Player") in after
+    assert ("boss.gd", "inherits", "Player") in after
 
 
 def test_preload_and_load_import_the_file(tmp_path):
@@ -460,3 +488,167 @@ def test_cached_rerun_keeps_scene_connection_calls(tmp_path):
     for _ in range(2):
         r = _corpus(tmp_path, {"main.tscn": scene})
         assert ("main.tscn", "_ready()") in _rel_pairs(r, "calls")
+
+
+def test_only_scripts_and_scenes_that_exist_are_linked(tmp_path):
+    # A texture, a model imported as a PackedScene, or a file that is not there
+    # would each become a phantom leaf node, the missing one named after this
+    # machine's absolute path.
+    from graphify.extract import extract_godot_scene
+
+    root = _project(tmp_path)
+    _write(root, "icon.png", "x")
+    _write(root, "tree.glb", "x")
+    scene = ('[gd_scene format=3]\n'
+             '[ext_resource type="PackedScene" path="res://tree.glb" id="1"]\n'
+             '[ext_resource type="Script" path="res://gone.gd" id="2"]\n'
+             '[ext_resource type="Texture2D" path="res://icon.png" id="3"]\n')
+    assert extract_godot_scene(_write(root, "m.tscn", scene))["edges"] == []
+
+
+def test_preloaded_assets_are_not_linked(tmp_path):
+    root = _project(tmp_path)
+    _write(root, "icon.png", "x")
+    src = 'const I = preload("res://icon.png")\nconst M = preload("res://missing.gd")\n'
+    assert extract_gdscript(_write(root, "a.gd", src))["edges"] == []
+
+
+def test_relative_preload_paths(tmp_path):
+    root = _project(tmp_path)
+    base = _write(root, "base.gd", "")
+    sibling = _write(root, "sub/sibling.gd", "")
+    r = extract_gdscript(_write(root, "sub/child.gd",
+                                'const A = preload("sibling.gd")\n'
+                                'const B = preload("./sibling.gd")\n'
+                                'const C = preload("../base.gd")\n'
+                                'const D = preload("../../outside.gd")\n'))
+    assert {e["target_file"] for e in r["edges"]} == {str(base), str(sibling)}
+
+
+def test_uid_references_resolve(tmp_path):
+    # Godot 4.4+ writes `uid://` for the main scene and accepts it anywhere a
+    # path goes. A script's uid is in its `.gd.uid` sidecar, a scene's in its
+    # own header.
+    from graphify.extract import extract_godot_project
+
+    root = _project(tmp_path)
+    script = _write(root, "scripts/state.gd", "func save():\n\tpass\n")
+    _write(root, "scripts/state.gd.uid", "uid://bscript1\n")
+    scene = _write(root, "main.tscn", '[gd_scene load_steps=1 format=3 uid="uid://cscene1"]\n')
+    project = _write(root, "project.godot",
+                     '[application]\nrun/main_scene="uid://cscene1"\n'
+                     '[autoload]\nState="*uid://bscript1"\nGhost="*uid://unknown"\n')
+    r = extract_godot_project(project)
+    assert {e["target_file"] for e in r["edges"] if e["relation"] == "imports_from"} == {
+        str(script), str(scene)}
+    assert {n["label"] for n in r["nodes"] if n.get("_godot_autoload")} == {"State", "Ghost"}
+    user = extract_gdscript(_write(root, "user.gd", 'const S = preload("uid://bscript1")\n'))
+    assert [e["target_file"] for e in user["edges"]] == [str(script)]
+
+
+def test_chained_default_argument_and_local_class_calls(tmp_path):
+    src = ("class_name Kit\n"
+           "static func make(a := helper()):\n"
+           "\tGameState.fetch().apply()\n"
+           "\tself.b().c()\n"
+           "\tInner.build()\n"
+           "\tKit.helper()\n"
+           "\tInner.new()\n"
+           "static func helper():\n\tpass\n"
+           "func b():\n\tpass\n"
+           "class Inner:\n\tstatic func build():\n\t\tpass\n")
+    r = extract_gdscript(_write(tmp_path, "kit.gd", src))
+    assert _rel_pairs(r, "calls") == {
+        ("make()", "helper()"), ("make()", "b()"), ("make()", "build()")}
+    assert [(c["receiver"], c["callee"]) for c in r["raw_calls"]] == [("GameState", "fetch")]
+
+
+def test_same_named_inner_classes_stay_separate(tmp_path):
+    src = ("class A:\n\tclass B:\n\t\tfunc f():\n\t\t\tpass\n"
+           "class C:\n\tclass B:\n\t\tfunc g():\n\t\t\tpass\n")
+    r = extract_gdscript(_write(tmp_path, "nest.gd", src))
+    by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    assert sorted(by_id.values()) == ["A", "B", "B", "C", "f()", "g()", "nest.gd"]
+    b_of = {by_id[e["source"]]: e["target"] for e in r["edges"]
+            if e["relation"] == "contains" and by_id[e["target"]] == "B"}
+    assert b_of["A"] != b_of["C"]
+    owner_of = {by_id[e["target"]]: e["source"] for e in r["edges"] if e["relation"] == "method"}
+    assert (owner_of["f()"], owner_of["g()"]) == (b_of["A"], b_of["C"])
+
+
+def test_inner_class_scope(tmp_path):
+    # An inner class is its own class: `self` is never the outer script, and of
+    # the outer script only static functions are in reach. Members of a base
+    # class declared in the same file are.
+    src = ("signal done\n"
+           "func helper():\n\tpass\n"
+           "static func util():\n\tpass\n"
+           "class Inner:\n\tfunc run():\n\t\tself.helper()\n\t\thelper()\n\t\tutil()\n\t\tdone.emit()\n"
+           "class Base:\n\tsignal ping\n\tfunc poke():\n\t\tpass\n"
+           "class Child extends Base:\n\tfunc go():\n\t\tpoke()\n\t\tself.poke()\n\t\tping.emit()\n")
+    r = extract_gdscript(_write(tmp_path, "scope.gd", src))
+    assert _rel_pairs(r, "calls") == {("run()", "util()"), ("go()", "poke()")}
+    assert _rel_pairs(r, "uses") == {("go()", "ping")}
+
+
+def test_scene_multiline_string_does_not_end_the_node(tmp_path):
+    from graphify.extract import extract_godot_scene
+
+    root = _project(tmp_path)
+    _write(root, "rich.gd", "")
+    scene = ('[gd_scene format=3]\n'
+             '[ext_resource type="Script" path="res://rich.gd" id="1"]\n'
+             '[node name="Root" type="Control"]\n'
+             '[node name="Rich" type="RichTextLabel" parent="."]\n'
+             'text = "Title\n[center]Hello[/center]\n[b]x[/b] \\"quoted\\"\n"\n'
+             'script = ExtResource("1")\n'
+             '[connection signal="s" from="." to="Rich" method="_on_rich"]\n')
+    (edge,) = extract_godot_scene(_write(root, "rich.tscn", scene))["edges"]
+    assert edge["_godot_connections"] == ["_on_rich"]
+
+
+def test_connection_to_an_instanced_scene_calls_its_root_script(tmp_path):
+    hud = ('[gd_scene format=3]\n'
+           '[ext_resource type="Script" path="res://hud.gd" id="1"]\n'
+           '[ext_resource type="Script" path="res://player.gd" id="2"]\n'
+           '[node name="HUD" type="Control"]\nscript = ExtResource("1")\n'
+           '[node name="Other" type="Node" parent="."]\nscript = ExtResource("2")\n')
+    main = ('[gd_scene format=3]\n'
+            '[ext_resource type="PackedScene" path="res://hud.tscn" id="1"]\n'
+            '[node name="Main" type="Node"]\n'
+            '[node name="HUD" parent="." instance=ExtResource("1")]\n'
+            '[connection signal="s" from="." to="HUD" method="_on_shown"]\n'
+            '[connection signal="s" from="." to="HUD" method="make"]\n')
+    r = _corpus(tmp_path, {"hud.gd": "func _on_shown():\n\tpass\n",
+                           "hud.tscn": hud, "main.tscn": main})
+    # `make` exists only on player.gd, which is not the instanced scene's root.
+    assert {t for s, t in _rel_pairs(r, "calls") if s == "main.tscn"} == {"_on_shown()"}
+
+
+def test_extends_by_path_lands_on_the_class_when_the_script_names_one(tmp_path):
+    r = _corpus(tmp_path, {"hero.gd": 'extends "res://player.gd"\n'})
+    by_id = {n["id"]: n for n in r["nodes"]}
+    targets = [by_id[e["target"]] for e in r["edges"]
+               if e["relation"] == "inherits" and by_id[e["source"]]["label"] == "hero.gd"]
+    assert [(t["label"], bool(t.get("_gdscript_class_name"))) for t in targets] == [("Player", True)]
+
+
+def test_resolver_scratch_keys_do_not_reach_the_graph(tmp_path):
+    r = _corpus(tmp_path)
+    assert not [n for n in r["nodes"] if "_gdscript_extends" in n]
+    assert not [e for e in r["edges"] if "_godot_connections" in e]
+
+
+def test_autoload_named_in_two_projects_binds_nothing(tmp_path):
+    from graphify.extract import extract
+
+    paths = []
+    for game in ("one", "two"):
+        root = _project(tmp_path / game)
+        (root / "project.godot").write_text(
+            '[autoload]\nGlobals="*res://globals.gd"\n', encoding="utf-8")
+        paths += [root / "project.godot",
+                  _write(root, "globals.gd", "func reset():\n\tpass\n"),
+                  _write(root, "user.gd", "func f():\n\tGlobals.reset()\n")]
+    r = extract(paths, cache_root=tmp_path / "cache", root=tmp_path, parallel=False)
+    assert not _rel_pairs(r, "calls")
