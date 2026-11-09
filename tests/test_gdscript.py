@@ -45,3 +45,94 @@ def test_empty_script_yields_only_the_file_node(tmp_path):
     assert "error" not in r
     assert _labels(r) == {"empty.gd"}
     assert r["edges"] == []
+
+
+SCRIPT = """\
+class_name Player
+extends CharacterBody2D
+
+signal hit(amount)
+enum State { IDLE, RUN }
+
+func _ready():
+\thelper()
+\tself.move()
+\thit.emit(1)
+\temit_signal("hit")
+\thit.connect(on_hit)
+
+func helper():
+\tpass
+
+func move():
+\tpass
+
+func on_hit(amount):
+\tpass
+
+class Inventory:
+\tfunc helper():
+\t\tpass
+\tfunc add():
+\t\thelper()
+"""
+
+
+def test_definitions(tmp_path):
+    r = extract_gdscript(_write(tmp_path, "player.gd", SCRIPT))
+    assert {"player.gd", "Player", "hit", "State", "Inventory",
+            "_ready()", "helper()", "move()", "on_hit()", "add()"} <= _labels(r)
+
+
+def test_ownership_and_inheritance(tmp_path):
+    r = extract_gdscript(_write(tmp_path, "player.gd", SCRIPT))
+    assert ("player.gd", "Player") in _rel_pairs(r, "contains")
+    assert ("Player", "_ready()") in _rel_pairs(r, "method")
+    assert ("Player", "hit") in _rel_pairs(r, "contains")
+    assert ("Player", "Inventory") in _rel_pairs(r, "contains")
+    assert ("Inventory", "add()") in _rel_pairs(r, "method")
+    assert ("Player", "CharacterBody2D") in _rel_pairs(r, "inherits")
+
+
+def test_engine_base_class_is_a_sourceless_stub(tmp_path):
+    r = extract_gdscript(_write(tmp_path, "player.gd", SCRIPT))
+    stub = next(n for n in r["nodes"] if n["label"] == "CharacterBody2D")
+    assert stub["source_file"] == ""
+    assert stub["origin_file"].endswith("player.gd")
+
+
+def test_same_file_calls_and_signals(tmp_path):
+    r = extract_gdscript(_write(tmp_path, "player.gd", SCRIPT))
+    calls = _rel_pairs(r, "calls")
+    assert ("_ready()", "helper()") in calls
+    assert ("_ready()", "move()") in calls
+    assert ("hit", "on_hit()") in calls
+    assert ("_ready()", "hit") in _rel_pairs(r, "uses")
+
+
+def test_inner_method_shadows_top_level_function(tmp_path):
+    r = extract_gdscript(_write(tmp_path, "player.gd", SCRIPT))
+    by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    assert len([i for i, label in by_id.items() if label == "helper()"]) == 2
+    inv = next(i for i, label in by_id.items() if label == "Inventory")
+    inner = {by_id[e["target"]]: e["target"] for e in r["edges"]
+             if e["relation"] == "method" and e["source"] == inv}
+    calls = {(e["source"], e["target"]) for e in r["edges"] if e["relation"] == "calls"}
+    assert (inner["add()"], inner["helper()"]) in calls
+
+
+def test_script_without_class_name_is_owned_by_the_file(tmp_path):
+    r = extract_gdscript(_write(tmp_path, "util.gd", "extends Node\nfunc f():\n\tpass\n"))
+    assert ("util.gd", "f()") in _rel_pairs(r, "contains")
+    assert ("util.gd", "Node") in _rel_pairs(r, "inherits")
+
+
+def test_syntax_error_keeps_what_parsed(tmp_path):
+    r = extract_gdscript(_write(tmp_path, "bad.gd", "func ok():\n\tpass\n\nfunc broken(:\n"))
+    assert "ok()" in _labels(r)
+
+
+def test_godot3_syntax_does_not_raise(tmp_path):
+    src = "extends Node\nonready var x = 1\nexport var y = 2\nfunc f():\n\tyield(self, \"done\")\n"
+    r = extract_gdscript(_write(tmp_path, "old.gd", src))
+    assert "f()" in _labels(r)
