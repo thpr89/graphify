@@ -42,9 +42,16 @@ def _res_path(path: Path, res: str) -> Path | None:
     return Path(target)
 
 
-def _res_target_id(path: Path, res: str) -> str | None:
+def _file_link(path: Path, res: str) -> dict | None:
+    """Target fields for a file-to-file edge to `res`, or None if unresolvable.
+    Always `imports_from` with `target_file`: that pair is what the corpus
+    passes use to keep same-named siblings (player.gd / player.tscn, which
+    share one file id) apart when they re-point the edge."""
     target = _res_path(path, res)
-    return _make_id(str(target)) if target is not None else None
+    if target is None:
+        return None
+    return {"target": _make_id(str(target)), "relation": "imports_from",
+            "target_file": str(target)}
 
 
 def extract_gdscript(path: Path) -> dict:
@@ -106,24 +113,6 @@ def extract_gdscript(path: Path) -> dict:
             **extra,
         })
 
-    def ref_stub(name: str) -> str:
-        """Sourceless stub for a class defined elsewhere (another script's
-        `class_name`, or an engine class). The corpus-level rewire collapses it
-        onto the unique real definition; engine names dangle. A sourced stub
-        would bake this file's path into the id and block the rewire."""
-        nid = _make_id(name)
-        if nid not in seen_ids:
-            seen_ids.add(nid)
-            nodes.append({
-                "id": nid,
-                "label": name,
-                "file_type": "code",
-                "source_file": "",
-                "source_location": "",
-                "origin_file": str_path,
-            })
-        return nid
-
     file_nid = _make_id(str_path)
     add_node(file_nid, path.name, 1)
 
@@ -154,9 +143,12 @@ def extract_gdscript(path: Path) -> dict:
         if base.type == "type":
             pending_extends.append((owner_nid, text(base), line_of(ext)))
         elif base.type == "string":  # extends "res://base.gd"
-            target = _res_target_id(path, string_value(base))
-            if target:
-                add_edge(owner_nid, target, "inherits", line_of(ext))
+            link = _file_link(path, string_value(base))
+            if link:
+                # resolve_gdscript_named_calls adds the `inherits` edge once
+                # the corpus passes have settled this edge's target.
+                add_edge(owner_nid, link["target"], link["relation"], line_of(ext),
+                         target_file=link["target_file"], context="extends")
 
     # A script that declares `class_name Foo` IS the class Foo: its members
     # hang off the class node. Without one they hang off the file node.
@@ -222,8 +214,16 @@ def extract_gdscript(path: Path) -> dict:
 
     walk_defs(root, owner, None)
 
+    # A base class from this file is linked now. Any other name is either
+    # another script's `class_name` or an engine class, and only the corpus can
+    # tell which: leave the name on the node for resolve_gdscript_named_calls.
+    # No placeholder node is minted, because `Player` would share its id with a
+    # root-level player.gd file node and `Node` would join every script.
     for owner_nid, base, line in pending_extends:
-        add_edge(owner_nid, classes.get(base) or ref_stub(base), "inherits", line)
+        if base in classes:
+            add_edge(owner_nid, classes[base], "inherits", line)
+        else:
+            next(n for n in nodes if n["id"] == owner_nid)["_gdscript_extends"] = base
 
     def lookup(table: dict[str | None, dict[str, str]], scope: str | None, name: str) -> str | None:
         return table.get(scope, {}).get(name) or table.get(None, {}).get(name)
@@ -244,9 +244,10 @@ def extract_gdscript(path: Path) -> dict:
                 add_edge(caller, sig, "uses", line_of(node))
             return
         if name in ("preload", "load") and arg is not None and arg.type == "string":
-            target = _res_target_id(path, string_value(arg))
-            if target:
-                add_edge(file_nid, target, "imports_from", line_of(node))
+            link = _file_link(path, string_value(arg))
+            if link:
+                add_edge(file_nid, link["target"], link["relation"], line_of(node),
+                         target_file=link["target_file"])
             return
         target = lookup(funcs, scope, name)
         if target:
@@ -341,8 +342,8 @@ def _godot_edge(src: str, tgt: str, relation: str, str_path: str, line: int, **e
 
 
 def extract_godot_scene(path: Path) -> dict:
-    """Extract a .tscn scene's wiring: the scripts it attaches, the scenes it
-    instances, and the methods its signal connections call."""
+    """Extract a .tscn scene's wiring: the scripts it attaches and the scenes
+    it instances (as imports), and the methods its signal connections call."""
     text, error = _read_godot_text(path)
     if text is None:
         return error or {"nodes": [], "edges": []}
@@ -354,8 +355,8 @@ def extract_godot_scene(path: Path) -> dict:
     edges: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
-    def link(target: str | None, relation: str, line: int, **extra) -> None:
-        if target and target != file_nid and (relation, target) not in seen:
+    def link(target: str, relation: str, line: int, **extra) -> None:
+        if target != file_nid and (relation, target) not in seen:
             seen.add((relation, target))
             edges.append(_godot_edge(file_nid, target, relation, str_path, line, **extra))
 
@@ -377,9 +378,11 @@ def extract_godot_scene(path: Path) -> dict:
         current_node = None
         if kind == "ext_resource" and "id" in attrs and "path" in attrs:
             ext[attrs["id"]] = (attrs.get("type", ""), attrs["path"])
-            relation = {"Script": "uses", "PackedScene": "instantiates"}.get(attrs.get("type", ""))
-            if relation:
-                link(_res_target_id(path, attrs["path"]), relation, line_no)
+            context = {"Script": "script", "PackedScene": "instance"}.get(attrs.get("type", ""))
+            target = _file_link(path, attrs["path"]) if context else None
+            if target:
+                link(target["target"], target["relation"], line_no,
+                     target_file=target["target_file"], context=context)
         elif kind == "node" and "name" in attrs:
             parent = attrs.get("parent")
             if parent is None:
@@ -418,17 +421,111 @@ def extract_godot_project(path: Path) -> dict:
         if header:
             section = header.group(1)
         elif section == "autoload" and (m := _AUTOLOAD_RE.match(line)):
-            name, target = m.group(1), _res_target_id(path, m.group(2))
+            name, target = m.group(1), _file_link(path, m.group(2))
             nid = _make_id(str_path, "autoload", name)
             nodes.append({"id": nid, "label": name, "file_type": "code",
                           "source_file": str_path, "source_location": f"L{line_no}",
                           "_godot_autoload": True})
             edges.append(_godot_edge(file_nid, nid, "contains", str_path, line_no))
             if target:
-                edges.append(_godot_edge(nid, target, "uses", str_path, line_no))
+                edges.append(_godot_edge(nid, target["target"], target["relation"], str_path,
+                                         line_no, target_file=target["target_file"]))
         elif section == "application" and (m := _MAIN_SCENE_RE.match(line)):
-            target = _res_target_id(path, m.group(1))
+            target = _file_link(path, m.group(1))
             if target:
-                edges.append(_godot_edge(file_nid, target, "uses", str_path, line_no))
+                edges.append(_godot_edge(file_nid, target["target"], target["relation"], str_path,
+                                         line_no, target_file=target["target_file"]))
 
     return {"nodes": nodes, "edges": edges}
+
+
+def resolve_gdscript_named_calls(
+    per_file: list[dict], all_nodes: list[dict], all_edges: list[dict]
+) -> None:
+    """Bind what a single script cannot: `extends Name` to the script declaring
+    `class_name Name`, and parked `Name.method()` calls when `Name` is such a
+    class or an autoload singleton (project.godot)."""
+    file_source_by_id = {
+        node["id"]: str(node["source_file"])
+        for node in all_nodes
+        if node.get("source_file")
+        and node.get("label") == Path(str(node["source_file"])).name
+    }
+    # ponytail: a name defined in two Godot projects in one scan binds nothing;
+    # scope by nearest project.godot if multi-project repos matter.
+    scripts_by_name: dict[str, set[str]] = {}
+    autoload_names = {
+        node["id"]: str(node["label"]) for node in all_nodes if node.get("_godot_autoload")
+    }
+    for edge in all_edges:
+        name = autoload_names.get(edge.get("source"))
+        target = file_source_by_id.get(edge.get("target"))
+        if name and target and edge.get("relation") == "imports_from" and target.endswith(".gd"):
+            scripts_by_name.setdefault(name, set()).add(target)
+    functions: dict[tuple[str, str], list[str]] = {}
+    class_ids: dict[str, list[str]] = {}
+    for node in all_nodes:
+        if not node.get("source_file"):
+            continue
+        source = str(node["source_file"])
+        if node.get("_gdscript_class_name"):
+            scripts_by_name.setdefault(str(node["label"]), set()).add(source)
+            class_ids.setdefault(str(node["label"]), []).append(node["id"])
+        elif node.get("_gdscript_func"):
+            functions.setdefault((source, str(node["label"]).removesuffix("()")), []).append(node["id"])
+
+    inherits = [
+        (node["id"], bases[0], node.get("source_file", ""), node.get("source_location", ""))
+        for node in all_nodes
+        if len(bases := class_ids.get(str(node.get("_gdscript_extends", "")), [])) == 1
+    ]
+    # `extends "res://base.gd"` was emitted as an import so the corpus passes
+    # could settle its target; it is settled now.
+    inherits += [
+        (edge["source"], edge["target"], edge.get("source_file", ""), edge.get("source_location", ""))
+        for edge in all_edges
+        if edge.get("context") == "extends" and edge.get("relation") == "imports_from"
+        and str(edge.get("source_file", "")).endswith(".gd")
+    ]
+    for source, target, source_file, location in inherits:
+        if source != target:
+            all_edges.append({
+                "source": source,
+                "target": target,
+                "relation": "inherits",
+                "confidence": "EXTRACTED",
+                "source_file": source_file,
+                "source_location": location,
+                "weight": 1.0,
+            })
+
+    existing = {
+        (edge.get("source"), edge.get("target"))
+        for edge in all_edges
+        if edge.get("relation") == "calls"
+    }
+    for result in per_file:
+        for call in result.get("raw_calls", []):
+            if call.get("language") != "gdscript":
+                continue
+            scripts = scripts_by_name.get(str(call.get("receiver", "")), set())
+            if len(scripts) != 1:
+                continue
+            candidates = functions.get((next(iter(scripts)), str(call.get("callee", ""))), [])
+            caller = call.get("caller_nid")
+            if len(candidates) != 1 or candidates[0] == caller:
+                continue
+            pair = (caller, candidates[0])
+            if pair in existing:
+                continue
+            existing.add(pair)
+            all_edges.append({
+                "source": caller,
+                "target": candidates[0],
+                "relation": "calls",
+                "context": "named_receiver_call",
+                "confidence": "INFERRED",
+                "source_file": call.get("source_file", ""),
+                "source_location": call.get("source_location", ""),
+                "weight": 1.0,
+            })

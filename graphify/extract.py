@@ -74,6 +74,7 @@ from graphify.extractors.gdscript import (  # noqa: F401
     extract_gdscript,
     extract_godot_project,
     extract_godot_scene,
+    resolve_gdscript_named_calls,
 )
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
@@ -8763,6 +8764,9 @@ register_language_resolver(
 )
 register_language_resolver(
     LanguageResolver("r_sourced_calls", frozenset({".r", ".R"}), resolve_r_sourced_calls)
+)
+register_language_resolver(
+    LanguageResolver("gdscript_named_calls", frozenset({".gd"}), resolve_gdscript_named_calls)
 )
 register_language_resolver(
     LanguageResolver(
